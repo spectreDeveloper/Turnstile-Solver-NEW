@@ -127,83 +127,6 @@ class TurnstileAPIServer:
         self.console.print(info_panel)
         self.console.print()
 
-    async def load_captcha(self, page, website_key: str, action: str = ''):
-        """Add Turnstile to existing page."""
-        script = f"""
-        window.captchaToken = null;
-        window.turnstileWidget = null;
-        
-        window.onCaptchaSuccess = function(token) {{
-            console.log('Captcha solved successfully, token:', token);
-            window.captchaToken = token;
-        }};
-        
-        window.onCaptchaError = function(error) {{
-            console.log('Captcha error:', error);
-        }};
-        
-        window.onCaptchaExpired = function() {{
-            console.log('Captcha expired');
-            window.captchaToken = null;
-        }};
-        
-        // Удаляем существующие виджеты
-        const existing = document.querySelectorAll('.cf-turnstile, [data-sitekey]');
-        existing.forEach(el => el.remove());
-
-        const captchaDiv = document.createElement('div');
-        captchaDiv.className = 'cf-turnstile';
-        captchaDiv.setAttribute('data-sitekey', '{website_key}');
-        captchaDiv.setAttribute('data-callback', 'onCaptchaSuccess');
-        captchaDiv.setAttribute('data-error-callback', 'onCaptchaError');
-        captchaDiv.setAttribute('data-expired-callback', 'onCaptchaExpired');
-        captchaDiv.setAttribute('data-action', '{action}');
-        captchaDiv.style.position = 'fixed';
-        captchaDiv.style.top = '20px';
-        captchaDiv.style.right = '20px';
-        captchaDiv.style.zIndex = '9999';
-        captchaDiv.style.backgroundColor = 'white';
-        captchaDiv.style.padding = '20px';
-        captchaDiv.style.borderRadius = '8px';
-        captchaDiv.style.boxShadow = '0 4px 12px rgba(0,0,0,0.3)';
-
-        document.body.appendChild(captchaDiv);
-
-        // Загружаем скрипт Turnstile если его нет
-        if (!document.querySelector('script[src*="turnstile"]')) {{
-            const script = document.createElement('script');
-            script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js';
-            script.async = true;
-            script.defer = true;
-            script.onload = function() {{
-                console.log('Turnstile script loaded');
-                // Принудительно рендерим виджет
-                if (window.turnstile) {{
-                    window.turnstileWidget = window.turnstile.render(captchaDiv, {{
-                        sitekey: '{website_key}',
-                        callback: window.onCaptchaSuccess,
-                        'error-callback': window.onCaptchaError,
-                        'expired-callback': window.onCaptchaExpired,
-                        action: '{action}'
-                    }});
-                }}
-            }};
-            document.head.appendChild(script);
-        }} else {{
-            // Если скрипт уже загружен, сразу рендерим виджет
-            if (window.turnstile) {{
-                window.turnstileWidget = window.turnstile.render(captchaDiv, {{
-                    sitekey: '{website_key}',
-                    callback: window.onCaptchaSuccess,
-                    'error-callback': window.onCaptchaError,
-                    'expired-callback': window.onCaptchaExpired,
-                    action: '{action}'
-                }});
-            }}
-        }}
-        """
-
-        await page.evaluate(script)
 
     async def _wait_for_turnstile_token(self, page, browser_index: int, timeout: int = 30) -> str:
         """Wait for Turnstile token with improved detection and forced interaction."""
@@ -218,8 +141,8 @@ class TurnstileAPIServer:
             attempt += 1
             
             try:
-                # Проверяем input поле
-                token = await locator.input_value(timeout=500)
+                # Проверяем input поле с более коротким timeout
+                token = await locator.input_value(timeout=200)
                 if token:
                     if self.debug:
                         logger.debug(f'Browser {browser_index}: Got captcha token from input: {token[:10]}...')
@@ -230,6 +153,13 @@ class TurnstileAPIServer:
                 if token:
                     if self.debug:
                         logger.debug(f'Browser {browser_index}: Got captcha token from global variable: {token[:10]}...')
+                    return token
+                    
+                # Дополнительная проверка других возможных мест токена
+                token = await page.evaluate('() => window.turnstileToken || window.cfTurnstileToken')
+                if token:
+                    if self.debug:
+                        logger.debug(f'Browser {browser_index}: Got captcha token from alternative variable: {token[:10]}...')
                     return token
                     
                 # Принудительно кликаем на виджет каждую попытку (как в старом коде)
@@ -301,8 +231,8 @@ class TurnstileAPIServer:
                 if self.debug:
                     logger.debug(f'Browser {browser_index}: Token check error: {str(e)}')
                     
-            # Добавляем небольшую задержку между попытками, как в старом коде
-            await asyncio.sleep(0.5)
+            # Сокращаем задержку между попытками для ускорения
+            await asyncio.sleep(0.2)
             
         if self.debug:
             logger.warning(f'Browser {browser_index}: Token not found within {timeout} seconds')
@@ -425,6 +355,69 @@ class TurnstileAPIServer:
                     logger.info(f"Cleaned up {deleted_count} old results")
             except Exception as e:
                 logger.error(f"Error during periodic cleanup: {e}")
+
+    async def _antishadow_inject(self, page):
+        """Inject antishadow script to bypass shadow DOM."""
+        await page.add_init_script("""
+          (function() {
+            const originalAttachShadow = Element.prototype.attachShadow;
+            Element.prototype.attachShadow = function(init) {
+              const shadow = originalAttachShadow.call(this, init);
+              if (init.mode === 'closed') {
+                window.__lastClosedShadowRoot = shadow;
+              }
+              return shadow;
+            };
+          })();
+        """)
+
+    async def _load_captcha(self, page, website_key: str, action: str = '', cdata: str = ''):
+        """Load Turnstile captcha with overlay."""
+        script = f"""
+
+        const overlay = document.createElement('div');
+        overlay.id = 'captcha-overlay';
+        overlay.style.position = 'absolute';
+        overlay.style.top = '0';
+        overlay.style.left = '0';
+        overlay.style.width = '100vw';
+        overlay.style.height = '100vh';
+        overlay.style.backgroundColor = 'rgba(0, 0, 0, 0.5)';
+        overlay.style.display = 'flex';
+        overlay.style.justifyContent = 'center';
+        overlay.style.alignItems = 'center';
+        overlay.style.zIndex = '1000';
+
+        const captchaDiv = document.createElement('div');
+        captchaDiv.className = 'cf-turnstile';
+        captchaDiv.setAttribute('data-sitekey', '{website_key}');
+        captchaDiv.setAttribute('data-callback', 'onCaptchaSuccess');
+        {f'captchaDiv.setAttribute("data-action", "{action}");' if action else ''}
+        {f'captchaDiv.setAttribute("data-cdata", "{cdata}");' if cdata else ''}
+
+        overlay.appendChild(captchaDiv);
+        document.body.appendChild(overlay);
+
+        if (!document.querySelector('script[src*="turnstile"]')) {{
+            const script = document.createElement('script');
+            script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js';
+            script.async = true;
+            script.defer = true;
+            document.head.appendChild(script);
+        }}
+        """
+
+        await page.evaluate(script)
+
+
+    async def _route_handler(self, route):
+        """Block unnecessary resources for faster loading."""
+        blocked_extensions = ['.js', '.css', '.png', '.jpg', '.svg', '.gif', '.woff', '.ttf', '.ico']
+        
+        if any(route.request.url.endswith(ext) for ext in blocked_extensions):
+            await route.abort()
+        else:
+            await route.continue_()
 
     async def _solve_turnstile(self, task_id: str, url: str, sitekey: str, action: Optional[str] = None, cdata: Optional[str] = None):
         """Solve the Turnstile challenge."""
@@ -550,6 +543,9 @@ class TurnstileAPIServer:
 
         page = await context.new_page()
         
+        # Добавляем antishadow injection
+        await self._antishadow_inject(page)
+        
         await page.add_init_script("""
         Object.defineProperty(navigator, 'webdriver', {
             get: () => undefined,
@@ -560,24 +556,46 @@ class TurnstileAPIServer:
             loadTimes: function() {},
             csi: function() {},
         };
+        
+        // Предзагружаем Turnstile API для ускорения
+        if (!window.turnstile) {
+            const script = document.createElement('script');
+            script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js';
+            script.async = true;
+            script.defer = true;
+            script.crossOrigin = 'anonymous';
+            document.head.appendChild(script);
+        }
+        
+        // Предзагружаем DNS для Cloudflare
+        const link = document.createElement('link');
+        link.rel = 'dns-prefetch';
+        link.href = '//challenges.cloudflare.com';
+        document.head.appendChild(link);
         """)
         
         if self.browser_type in ['chromium', 'chrome', 'msedge']:
-            await page.set_viewport_size({"width": 800, "height": 600})
+            await page.set_viewport_size({"width": 600, "height": 250})
             if self.debug:
-                logger.debug(f"Browser {index}: Set viewport size to 800x600")
+                logger.debug(f"Browser {index}: Set viewport size to 600x250")
 
         start_time = time.time()
 
         try:
             if self.debug:
                 logger.debug(f"Browser {index}: Starting Turnstile solve for URL: {url} with Sitekey: {sitekey} | Action: {action} | Cdata: {cdata} | Proxy: {proxy}")
-                logger.debug(f"Browser {index}: Loading clean page")
+                logger.debug(f"Browser {index}: Blocking unnecessary resources")
 
+            # Блокируем ненужные ресурсы для ускорения
+            await page.route("**/*", self._route_handler)
+            
             await page.goto(url, wait_until='domcontentloaded', timeout=30000)
             
-            # Ждем загрузки страницы и Turnstile API
-            await asyncio.sleep(random.uniform(2.0, 3.0))
+            # Разблокируем рендеринг после загрузки страницы
+            await page.unroute("**/*", self._route_handler)
+            
+            # Сокращаем время ожидания - Turnstile API уже предзагружен
+            await asyncio.sleep(random.uniform(0.5, 1.0))
             
             # Проверяем, что страница загрузилась корректно
             page_title = await page.title()
@@ -625,8 +643,8 @@ class TurnstileAPIServer:
             
             if existing_turnstile == 0:
                 if self.debug:
-                    logger.debug(f"Browser {index}: No existing Turnstile found, adding one")
-                await self.load_captcha(page, sitekey, action or '')
+                    logger.debug(f"Browser {index}: No existing Turnstile found, adding one with overlay")
+                await self._load_captcha(page, sitekey, action or '', cdata or '')
             else:
                 if self.debug:
                     logger.debug(f"Browser {index}: Found {existing_turnstile} existing Turnstile widget(s)")
@@ -657,17 +675,22 @@ class TurnstileAPIServer:
 
             # Проверяем, загрузился ли Turnstile API после добавления виджета
             if not turnstile_loaded:
-                await asyncio.sleep(2.0)  # Даем время на загрузку API
-                turnstile_loaded_after = await page.evaluate('() => typeof window.turnstile !== "undefined"')
-                if turnstile_loaded_after and self.debug:
-                    logger.debug(f"Browser {index}: Turnstile API loaded after adding widget")
-                elif self.debug:
-                    logger.debug(f"Browser {index}: Turnstile API still not loaded, but widget should work anyway")
+                # Более агрессивное ожидание API с проверкой каждые 200мс
+                for i in range(10):  # Максимум 2 секунды
+                    await asyncio.sleep(0.2)
+                    turnstile_loaded_after = await page.evaluate('() => typeof window.turnstile !== "undefined"')
+                    if turnstile_loaded_after:
+                        if self.debug:
+                            logger.debug(f"Browser {index}: Turnstile API loaded after {i*0.2:.1f}s")
+                        break
+                else:
+                    if self.debug:
+                        logger.debug(f"Browser {index}: Turnstile API still not loaded, but widget should work anyway")
 
             # Дополнительный клик сразу после загрузки, как в старом коде
             try:
-                # Ждем немного для загрузки виджета
-                await asyncio.sleep(1.0)
+                # Сокращаем время ожидания виджета
+                await asyncio.sleep(0.3)
                 
                 widget = page.locator("//div[@class='cf-turnstile']")
                 widget_count = await widget.count()
@@ -788,6 +811,8 @@ class TurnstileAPIServer:
         else:
             return jsonify({"status": "ready", "data": result}), 200
 
+    
+
     @staticmethod
     async def index():
         """Serve the API documentation page."""
@@ -816,6 +841,7 @@ class TurnstileAPIServer:
                         <p class="font-semibold mb-2 text-red-400">Example usage:</p>
                         <code class="text-sm break-all text-red-300">/turnstile?url=https://example.com&sitekey=sitekey</code>
                     </div>
+
 
                     <div class="bg-gray-700 p-4 rounded-lg mb-6">
                         <p class="text-gray-200 font-semibold mb-3">📢 Connect with Us</p>
@@ -857,7 +883,7 @@ def parse_args():
     parser.add_argument('--browser', type=str, help='Specify browser name to use (e.g., chrome, firefox)')
     parser.add_argument('--version', type=str, help='Specify browser version to use (e.g., 139, 141)')
     parser.add_argument('--host', type=str, default='0.0.0.0', help='Specify the IP address where the API solver runs. (Default: 127.0.0.1)')
-    parser.add_argument('--port', type=str, default='6080', help='Set the port for the API solver to listen on. (Default: 6080)')
+    parser.add_argument('--port', type=str, default='5072', help='Set the port for the API solver to listen on. (Default: 5072)')
     return parser.parse_args()
 
 
