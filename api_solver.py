@@ -73,6 +73,10 @@ class TurnstileAPIServer:
         self.browser_version = browser_version
         self.console = Console()
         
+        # Initialize useragent and sec_ch_ua attributes
+        self.useragent = useragent
+        self.sec_ch_ua = None
+
         if self.browser_type in ['chromium', 'chrome', 'msedge']:
             if browser_name and browser_version:
                 config = browser_config.get_browser_config(browser_name, browser_version)
@@ -355,6 +359,12 @@ class TurnstileAPIServer:
                     version = getattr(self, 'browser_version', 'custom')
                     useragent = self.useragent
                     sec_ch_ua = getattr(self, 'sec_ch_ua', '')
+            else:
+                # Для camoufox и других браузеров используем значения по умолчанию
+                browser = self.browser_type
+                version = 'custom'
+                useragent = self.useragent
+                sec_ch_ua = getattr(self, 'sec_ch_ua', '')
 
             
             browser_configs.append({
