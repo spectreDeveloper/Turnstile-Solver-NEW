@@ -19,6 +19,7 @@ from rich.align import Align
 from rich import box
 
 
+
 COLORS = {
     'MAGENTA': '\033[35m',
     'BLUE': '\033[34m',
@@ -76,7 +77,8 @@ class TurnstileAPIServer:
         # Initialize useragent and sec_ch_ua attributes
         self.useragent = useragent
         self.sec_ch_ua = None
-
+        
+        
         if self.browser_type in ['chromium', 'chrome', 'msedge']:
             if browser_name and browser_version:
                 config = browser_config.get_browser_config(browser_name, browser_version)
@@ -111,7 +113,7 @@ class TurnstileAPIServer:
         combined_text.append("\n📁 GitHub: ", style="bold white")
         combined_text.append("https://github.com/D3-vin", style="cyan")
         combined_text.append("\n📁 Version: ", style="bold white")
-        combined_text.append("1.0", style="green")
+        combined_text.append("1.1", style="green")
         combined_text.append("\n")
 
         info_panel = Panel(
@@ -128,115 +130,6 @@ class TurnstileAPIServer:
         self.console.print()
 
 
-    async def _wait_for_turnstile_token(self, page, browser_index: int, timeout: int = 30) -> str:
-        """Wait for Turnstile token with improved detection and forced interaction."""
-        locator = page.locator('input[name="cf-turnstile-response"]')
-        start_time = time.time()
-        
-        token = ""
-        attempt = 0
-        clicked_widget = False
-        
-        while not token and (time.time() - start_time) < timeout:
-            attempt += 1
-            
-            try:
-                # Проверяем input поле с более коротким timeout
-                token = await locator.input_value(timeout=200)
-                if token:
-                    if self.debug:
-                        logger.debug(f'Browser {browser_index}: Got captcha token from input: {token[:10]}...')
-                    return token
-                    
-                # Проверяем глобальную переменную
-                token = await page.evaluate('() => window.captchaToken')
-                if token:
-                    if self.debug:
-                        logger.debug(f'Browser {browser_index}: Got captcha token from global variable: {token[:10]}...')
-                    return token
-                    
-                # Дополнительная проверка других возможных мест токена
-                token = await page.evaluate('() => window.turnstileToken || window.cfTurnstileToken')
-                if token:
-                    if self.debug:
-                        logger.debug(f'Browser {browser_index}: Got captcha token from alternative variable: {token[:10]}...')
-                    return token
-                    
-                # Принудительно кликаем на виджет каждую попытку (как в старом коде)
-                try:
-                    # Используем XPath селектор как в старом коде
-                    widget = page.locator("//div[@class='cf-turnstile']")
-                    widget_count = await widget.count()
-                    
-                    if self.debug and attempt % 5 == 0:
-                        logger.debug(f'Browser {browser_index}: Widget count: {widget_count}')
-                    
-                    if widget_count > 0:
-                        await widget.click(timeout=1000)
-                        if self.debug:
-                            logger.debug(f'Browser {browser_index}: Clicked on Turnstile widget using XPath (attempt {attempt})')
-                    else:
-                        # Fallback на другие селекторы
-                        selectors = [
-                            '[data-sitekey]',
-                            '.cf-turnstile iframe',
-                            'iframe[src*="turnstile"]',
-                            'div[class*="turnstile"]'
-                        ]
-                        
-                        for selector in selectors:
-                            widget = page.locator(selector)
-                            count = await widget.count()
-                            if count > 0:
-                                await widget.first.click(timeout=1000)
-                                if self.debug:
-                                    logger.debug(f'Browser {browser_index}: Clicked on Turnstile widget using selector: {selector} (attempt {attempt})')
-                                break
-                        else:
-                            if self.debug and attempt % 5 == 0:
-                                logger.debug(f'Browser {browser_index}: No Turnstile widgets found (attempt {attempt})')
-                            
-                except Exception as e:
-                    if self.debug:
-                        logger.debug(f'Browser {browser_index}: Error clicking widget (attempt {attempt}): {str(e)}')
-                
-                # Проверяем, загружен ли Turnstile API (только в начале)
-                if attempt == 1:
-                    current_turnstile_loaded = await page.evaluate('() => typeof window.turnstile !== "undefined"')
-                    if current_turnstile_loaded and self.debug:
-                        logger.debug(f'Browser {browser_index}: Turnstile API is loaded and ready')
-                    elif self.debug:
-                        logger.debug(f'Browser {browser_index}: Turnstile API not detected, but widget should work')
-                
-                # Принудительно запускаем виджет если он не активен
-                if attempt % 10 == 0:
-                    try:
-                        await page.evaluate('''
-                            if (window.turnstile && window.turnstileWidget) {
-                                try {
-                                    window.turnstile.reset(window.turnstileWidget);
-                                } catch(e) {
-                                    console.log("Error resetting turnstile:", e);
-                                }
-                            }
-                        ''')
-                    except Exception as e:
-                        if self.debug:
-                            logger.debug(f'Browser {browser_index}: Error resetting turnstile: {str(e)}')
-                    
-                if self.debug and attempt % 5 == 0:
-                    logger.debug(f'Browser {browser_index}: Attempt {attempt} - Waiting for Turnstile token...')
-                    
-            except Exception as e:
-                if self.debug:
-                    logger.debug(f'Browser {browser_index}: Token check error: {str(e)}')
-                    
-            # Сокращаем задержку между попытками для ускорения
-            await asyncio.sleep(0.2)
-            
-        if self.debug:
-            logger.warning(f'Browser {browser_index}: Token not found within {timeout} seconds')
-        return "CAPTCHA_FAIL"
 
 
     def _setup_routes(self) -> None:
@@ -245,6 +138,7 @@ class TurnstileAPIServer:
         self.app.route('/turnstile', methods=['GET'])(self.process_turnstile)
         self.app.route('/result', methods=['GET'])(self.get_result)
         self.app.route('/')(self.index)
+        
 
     async def _startup(self) -> None:
         """Initialize the browser and page pool on startup."""
@@ -371,53 +265,31 @@ class TurnstileAPIServer:
           })();
         """)
 
-    async def _load_captcha(self, page, website_key: str, action: str = '', cdata: str = ''):
-        """Load Turnstile captcha with overlay."""
-        script = f"""
-
-        const overlay = document.createElement('div');
-        overlay.id = 'captcha-overlay';
-        overlay.style.position = 'absolute';
-        overlay.style.top = '0';
-        overlay.style.left = '0';
-        overlay.style.width = '100vw';
-        overlay.style.height = '100vh';
-        overlay.style.backgroundColor = 'rgba(0, 0, 0, 0.5)';
-        overlay.style.display = 'flex';
-        overlay.style.justifyContent = 'center';
-        overlay.style.alignItems = 'center';
-        overlay.style.zIndex = '1000';
-
-        const captchaDiv = document.createElement('div');
-        captchaDiv.className = 'cf-turnstile';
-        captchaDiv.setAttribute('data-sitekey', '{website_key}');
-        captchaDiv.setAttribute('data-callback', 'onCaptchaSuccess');
-        {f'captchaDiv.setAttribute("data-action", "{action}");' if action else ''}
-        {f'captchaDiv.setAttribute("data-cdata", "{cdata}");' if cdata else ''}
-
-        overlay.appendChild(captchaDiv);
-        document.body.appendChild(overlay);
-
-        if (!document.querySelector('script[src*="turnstile"]')) {{
-            const script = document.createElement('script');
-            script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js';
-            script.async = true;
-            script.defer = true;
-            document.head.appendChild(script);
-        }}
-        """
-
-        await page.evaluate(script)
 
 
-    async def _route_handler(self, route):
-        """Block unnecessary resources for faster loading."""
-        blocked_extensions = ['.js', '.css', '.png', '.jpg', '.svg', '.gif', '.woff', '.ttf', '.ico']
+    async def _optimized_route_handler(self, route):
+        """Оптимизированный обработчик маршрутов для экономии ресурсов."""
+        url = route.request.url
+        resource_type = route.request.resource_type
         
-        if any(route.request.url.endswith(ext) for ext in blocked_extensions):
-            await route.abort()
-        else:
+        # Разрешаем только необходимые ресурсы
+        allowed_types = {'document', 'script', 'xhr', 'fetch'}
+        
+        # Разрешаем Turnstile API и связанные с Cloudflare скрипты
+        allowed_domains = [
+            'challenges.cloudflare.com',
+            'static.cloudflareinsights.com',
+            'cloudflare.com'
+        ]
+        
+        # Проверяем, разрешен ли ресурс
+        if resource_type in allowed_types:
             await route.continue_()
+        elif any(domain in url for domain in allowed_domains):
+            await route.continue_()  # Разрешаем Cloudflare ресурсы
+        else:
+            # Блокируем изображения, CSS, шрифты и прочие медиаресурсы
+            await route.abort()
 
     async def _solve_turnstile(self, task_id: str, url: str, sitekey: str, action: Optional[str] = None, cdata: Optional[str] = None):
         """Solve the Turnstile challenge."""
@@ -584,15 +456,21 @@ class TurnstileAPIServer:
         try:
             if self.debug:
                 logger.debug(f"Browser {index}: Starting Turnstile solve for URL: {url} with Sitekey: {sitekey} | Action: {action} | Cdata: {cdata} | Proxy: {proxy}")
-                logger.debug(f"Browser {index}: Blocking unnecessary resources")
+                logger.debug(f"Browser {index}: Setting up optimized page loading with resource blocking")
 
-            # Блокируем ненужные ресурсы для ускорения
-            await page.route("**/*", self._route_handler)
+            # Оптимизированная блокировка ресурсов для экономии трафика
+            await page.route("**/*", self._optimized_route_handler)
             
-            await page.goto(url, wait_until='domcontentloaded', timeout=30000)
+            # Загружаем реальную страницу с оптимизацией
+            await page.goto(url, wait_until='domcontentloaded', timeout=15000)
             
-            # Разблокируем рендеринг после загрузки страницы
-            await page.unroute("**/*", self._route_handler)
+            # Отключаем блокировку после загрузки основной страницы
+            await page.unroute("**/*", self._optimized_route_handler)
+            if self.debug:
+                logger.debug(f"Browser {index}: Resource blocking disabled, page optimization complete")
+            
+            # Небольшая пауза для стабилизации DOM
+            await asyncio.sleep(0.5)
             
             # Сокращаем время ожидания - Turnstile API уже предзагружен
             await asyncio.sleep(random.uniform(0.5, 1.0))
@@ -639,36 +517,28 @@ class TurnstileAPIServer:
                     if self.debug:
                         logger.debug(f"Browser {index}: Found {count} existing Turnstile widget(s) with selector: {selector}")
             
+            # Проверяем готовый токен в существующем input поле
             existing_input = await page.locator('input[name="cf-turnstile-response"]').count()
-            
-            if existing_turnstile == 0:
-                if self.debug:
-                    logger.debug(f"Browser {index}: No existing Turnstile found, adding one with overlay")
-                await self._load_captcha(page, sitekey, action or '', cdata or '')
-            else:
-                if self.debug:
-                    logger.debug(f"Browser {index}: Found {existing_turnstile} existing Turnstile widget(s)")
-                
-                # Проверяем, есть ли уже готовый токен
-                if existing_input > 0:
+            if existing_input > 0:
+                try:
                     existing_token = await page.locator('input[name="cf-turnstile-response"]').input_value(timeout=1000)
-                    if existing_token:
-                        if self.debug:
-                            logger.debug(f"Browser {index}: Found existing token: {existing_token[:10]}...")
+                    if existing_token and existing_token.strip():
                         elapsed_time = round(time.time() - start_time, 3)
-                        logger.info(f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{existing_token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds")
+                        logger.success(f"Browser {index}: Found existing valid token - {COLORS.get('MAGENTA')}{existing_token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds")
                         await save_result(task_id, "turnstile", {"value": existing_token, "elapsed_time": elapsed_time})
                         return
-                
-                # Дополнительная проверка токена в глобальной переменной
-                global_token = await page.evaluate('() => window.captchaToken || window.turnstileToken')
-                if global_token:
+                except Exception as e:
                     if self.debug:
-                        logger.debug(f"Browser {index}: Found existing token in global variable: {global_token[:10]}...")
-                    elapsed_time = round(time.time() - start_time, 3)
-                    logger.info(f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{global_token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds")
-                    await save_result(task_id, "turnstile", {"value": global_token, "elapsed_time": elapsed_time})
-                    return
+                        logger.debug(f"Browser {index}: Could not read existing token: {str(e)}")
+
+            # Если нет существующих виджетов, добавляем свой
+            if existing_turnstile == 0:
+                if self.debug:
+                    logger.debug(f"Browser {index}: No existing Turnstile found, injecting one")
+                await self._inject_turnstile(page, sitekey, action, cdata)
+            else:
+                if self.debug:
+                    logger.debug(f"Browser {index}: Found {existing_turnstile} existing Turnstile widget(s), using them")
 
             if self.debug:
                 logger.debug(f"Browser {index}: Starting Turnstile response retrieval loop")
@@ -718,17 +588,18 @@ class TurnstileAPIServer:
                 if self.debug:
                     logger.debug(f"Browser {index}: Error with initial click: {str(e)}")
 
-            token = await self._wait_for_turnstile_token(page, index)
+            # Ожидаем решения капчи
+            token = await self._wait_for_token(page, index)
             
             if token and token != "CAPTCHA_FAIL":
                 elapsed_time = round(time.time() - start_time, 3)
-                logger.info(f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds")
+                logger.success(f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds")
                 await save_result(task_id, "turnstile", {"value": token, "elapsed_time": elapsed_time})
             else:
                 elapsed_time = round(time.time() - start_time, 3)
                 await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time})
                 if self.debug:
-                    logger.error(f"Browser {index}: Error solving Turnstile in {COLORS.get('RED')}{elapsed_time}{COLORS.get('RESET')} Seconds")
+                    logger.error(f"Browser {index}: Failed to solve captcha in {COLORS.get('RED')}{elapsed_time}{COLORS.get('RESET')} Seconds")
         except Exception as e:
             elapsed_time = round(time.time() - start_time, 3)
             await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time})
@@ -759,6 +630,138 @@ class TurnstileAPIServer:
                 if self.debug:
                     logger.warning(f"Browser {index}: Error returning browser to pool: {str(e)}")
 
+    async def _inject_turnstile(self, page, sitekey: str, action: str = None, cdata: str = None):
+        """Оптимизированное внедрение Turnstile виджета."""
+        script = f"""
+        // Проверяем, не существует ли уже контейнер
+        if (document.getElementById('injected-captcha-container')) {{
+            console.log('Turnstile container already exists');
+            return;
+        }}
+        
+        // Минимальный контейнер для капчи
+        const captchaDiv = document.createElement('div');
+        captchaDiv.id = 'injected-captcha-container';
+        captchaDiv.className = 'cf-turnstile';
+        captchaDiv.setAttribute('data-sitekey', '{sitekey}');
+        captchaDiv.setAttribute('data-callback', 'onTurnstileSuccess');
+        {f'captchaDiv.setAttribute("data-action", "{action}");' if action else ''}
+        {f'captchaDiv.setAttribute("data-cdata", "{cdata}");' if cdata else ''}
+        
+        // Минимальные стили
+        captchaDiv.style.cssText = `
+            position: fixed !important;
+            top: 20px !important;
+            left: 20px !important;
+            z-index: 99999 !important;
+            background: white !important;
+            padding: 10px !important;
+            border: 1px solid #ccc !important;
+            border-radius: 4px !important;
+        `;
+        
+        document.body.appendChild(captchaDiv);
+
+        // Оптимизированная функция обратного вызова
+        window.onTurnstileSuccess = function(token) {{
+            console.log('✓ Turnstile token received:', token.substring(0, 20) + '...');
+            
+            // Сохраняем в мультипльных местах
+            window.captchaToken = token;
+            window.turnstileToken = token;
+            window.cfTurnstileResponse = token;
+            
+            // Обновляем или создаем input поле
+            let input = document.querySelector('input[name="cf-turnstile-response"]');
+            if (!input) {{
+                input = document.createElement('input');
+                input.type = 'hidden';
+                input.name = 'cf-turnstile-response';
+                document.body.appendChild(input);
+            }}
+            input.value = token;
+            
+            window.turnstileReady = true;
+        }};
+
+        // Оптимизированная загрузка API
+        if (!window.turnstile && !document.querySelector('script[src*="turnstile"]')) {{
+            const script = document.createElement('script');
+            script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js';
+            script.async = true;
+            script.defer = true;
+            document.head.appendChild(script);
+        }}
+        """
+        
+        await page.evaluate(script)
+        await asyncio.sleep(1)  # Ждем загрузки API
+
+    async def _wait_for_token(self, page, browser_index: int, timeout: int = 25) -> str:
+        """Оптимизированное ожидание токена Turnstile."""
+        start_time = time.time()
+        attempt = 0
+        last_click_time = 0
+        
+        while (time.time() - start_time) < timeout:
+            attempt += 1
+            current_time = time.time()
+            
+            try:
+                # Первая проверка: флаг готовности
+                if await page.evaluate('() => window.turnstileReady === true'):
+                    token = await page.evaluate('() => window.captchaToken || window.turnstileToken || window.cfTurnstileResponse')
+                    if token and token.strip():
+                        if self.debug:
+                            logger.debug(f'Browser {browser_index}: Token ready via flag: {token[:10]}...')
+                        return token
+                
+                # Вторая проверка: input поле
+                input_locator = page.locator('input[name="cf-turnstile-response"]')
+                if await input_locator.count() > 0:
+                    token = await input_locator.input_value(timeout=200)
+                    if token and len(token.strip()) > 10:
+                        if self.debug:
+                            logger.debug(f'Browser {browser_index}: Token from input: {token[:10]}...')
+                        return token
+                
+                # Третья проверка: глобальные переменные
+                token = await page.evaluate('() => window.captchaToken || window.turnstileToken || window.cfTurnstileResponse')
+                if token and len(token.strip()) > 10:
+                    if self.debug:
+                        logger.debug(f'Browser {browser_index}: Token from globals: {token[:10]}...')
+                    return token
+                
+                # Оптимизированные клики
+                if current_time - last_click_time > 2:
+                    widget_selectors = ['.cf-turnstile', '[data-sitekey]']
+                    for selector in widget_selectors:
+                        widget = page.locator(selector)
+                        if await widget.count() > 0:
+                            await widget.first.click(timeout=800)
+                            last_click_time = current_time
+                            if self.debug and attempt % 10 == 0:
+                                logger.debug(f'Browser {browser_index}: Widget clicked ({selector}) - attempt {attempt}')
+                            break
+                
+                if self.debug and attempt % 20 == 0:
+                    elapsed = round(current_time - start_time, 1)
+                    logger.debug(f'Browser {browser_index}: Still waiting... {elapsed}s/{timeout}s (attempt {attempt})')
+                    
+            except Exception as e:
+                if self.debug and attempt % 15 == 0:
+                    logger.debug(f'Browser {browser_index}: Check error (attempt {attempt}): {str(e)[:50]}...')
+            
+            # Оптимизированная задержка
+            if attempt < 10:
+                await asyncio.sleep(0.3)  # Быстрые проверки
+            else:
+                await asyncio.sleep(0.7)  # Медленнее потом
+        
+        if self.debug:
+            logger.warning(f'Browser {browser_index}: Timeout after {timeout}s, no valid token found')
+        return "CAPTCHA_FAIL"
+
 
     async def process_turnstile(self):
         """Handle the /turnstile endpoint requests."""
@@ -769,47 +772,81 @@ class TurnstileAPIServer:
 
         if not url or not sitekey:
             return jsonify({
-                "status": "error",
-                "error": "Both 'url' and 'sitekey' are required"
-            }), 400
+                "errorId": 1,
+                "errorCode": "ERROR_WRONG_PAGEURL",
+                "errorDescription": "Both 'url' and 'sitekey' are required"
+            }), 200
 
         task_id = str(uuid.uuid4())
-        await save_result(task_id, "turnstile", {"status": "CAPTCHA_NOT_READY"})
+        await save_result(task_id, "turnstile", {
+            "status": "CAPTCHA_NOT_READY",
+            "createTime": int(time.time()),
+            "url": url,
+            "sitekey": sitekey,
+            "action": action,
+            "cdata": cdata
+        })
 
         try:
             asyncio.create_task(self._solve_turnstile(task_id=task_id, url=url, sitekey=sitekey, action=action, cdata=cdata))
 
             if self.debug:
                 logger.debug(f"Request completed with taskid {task_id}.")
-            return jsonify({"task_id": task_id}), 200
+            return jsonify({
+                "errorId": 0,
+                "taskId": task_id
+            }), 200
         except Exception as e:
             logger.error(f"Unexpected error processing request: {str(e)}")
             return jsonify({
-                "status": "error",
-                "error": str(e)
-            }), 500
+                "errorId": 1,
+                "errorCode": "ERROR_UNKNOWN",
+                "errorDescription": str(e)
+            }), 200
 
     async def get_result(self):
         """Return solved data"""
         task_id = request.args.get('id')
 
         if not task_id:
-            return jsonify({"status": "error", "error": "Invalid task ID/Request parameter"}), 400
+            return jsonify({
+                "errorId": 1,
+                "errorCode": "ERROR_WRONG_CAPTCHA_ID",
+                "errorDescription": "Invalid task ID/Request parameter"
+            }), 200
 
         result = await load_result(task_id)
         if not result:
-            return jsonify({"status": "error", "error": "Task not found"}), 404
+            return jsonify({
+                "errorId": 1,
+                "errorCode": "ERROR_CAPTCHA_UNSOLVABLE",
+                "errorDescription": "Task not found"
+            }), 200
 
         if result == "CAPTCHA_NOT_READY" or (isinstance(result, dict) and result.get("status") == "CAPTCHA_NOT_READY"):
             return jsonify({"status": "processing"}), 200
 
         if isinstance(result, dict) and result.get("value") == "CAPTCHA_FAIL":
-            return jsonify({"status": "fail", **result}), 422
+            return jsonify({
+                "errorId": 1,
+                "errorCode": "ERROR_CAPTCHA_UNSOLVABLE",
+                "errorDescription": "Workers could not solve the Captcha"
+            }), 200
 
-        if isinstance(result, dict):
-            return jsonify({"status": "ready", **result}), 200
+        if isinstance(result, dict) and result.get("value") and result.get("value") != "CAPTCHA_FAIL":
+            return jsonify({
+                "errorId": 0,
+                "status": "ready",
+                "solution": {
+                    "token": result["value"]
+                }
+            }), 200
         else:
-            return jsonify({"status": "ready", "data": result}), 200
+            return jsonify({
+                "errorId": 1,
+                "errorCode": "ERROR_CAPTCHA_UNSOLVABLE",
+                "errorDescription": "Workers could not solve the Captcha"
+            }), 200
 
     
 
