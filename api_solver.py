@@ -74,6 +74,7 @@ class TurnstileAPIServer:
         self.browser_version = browser_version
         self.console = Console()
         
+        # Initialize useragent and sec_ch_ua attributes
         self.useragent = useragent
         self.sec_ch_ua = None
         
@@ -112,7 +113,7 @@ class TurnstileAPIServer:
         combined_text.append("\n📁 GitHub: ", style="bold white")
         combined_text.append("https://github.com/D3-vin", style="cyan")
         combined_text.append("\n📁 Version: ", style="bold white")
-        combined_text.append("1.2", style="green")
+        combined_text.append("1.2a", style="green")
         combined_text.append("\n")
 
         info_panel = Panel(
@@ -147,6 +148,7 @@ class TurnstileAPIServer:
             await init_db()
             await self._initialize_browser()
             
+            # Запускаем периодическую очистку старых результатов
             asyncio.create_task(self._periodic_cleanup())
             
         except Exception as e:
@@ -182,6 +184,7 @@ class TurnstileAPIServer:
                     useragent = self.useragent
                     sec_ch_ua = getattr(self, 'sec_ch_ua', '')
             else:
+                # Для camoufox и других браузеров используем значения по умолчанию
                 browser = self.browser_type
                 version = 'custom'
                 useragent = self.useragent
@@ -237,6 +240,7 @@ class TurnstileAPIServer:
                 logger.debug(f"Browser {i+1} Sec-CH-UA: {config['sec_ch_ua']}")
 
     async def _periodic_cleanup(self):
+        """Periodic cleanup of old results every hour"""
         while True:
             try:
                 await asyncio.sleep(3600)
@@ -263,6 +267,7 @@ class TurnstileAPIServer:
 
 
     async def _optimized_route_handler(self, route):
+        """Оптимизированный обработчик маршрутов для экономии ресурсов."""
         url = route.request.url
         resource_type = route.request.resource_type
 
@@ -282,12 +287,15 @@ class TurnstileAPIServer:
             await route.abort()
 
     async def _block_rendering(self, page):
+        """Блокировка рендеринга для экономии ресурсов"""
         await page.route("**/*", self._optimized_route_handler)
 
     async def _unblock_rendering(self, page):
+        """Разблокировка рендеринга"""
         await page.unroute("**/*", self._optimized_route_handler)
 
     async def _find_turnstile_elements(self, page, index: int):
+        """Умная проверка всех возможных Turnstile элементов"""
         selectors = [
             '.cf-turnstile',
             '[data-sitekey]',
@@ -300,7 +308,13 @@ class TurnstileAPIServer:
         elements = []
         for selector in selectors:
             try:
-                count = await page.locator(selector).count()
+                # Безопасная проверка count()
+                try:
+                    count = await page.locator(selector).count()
+                except Exception:
+                    # Если count() дает ошибку, пропускаем этот селектор
+                    continue
+                    
                 if count > 0:
                     elements.append((selector, count))
                     if self.debug:
@@ -312,24 +326,127 @@ class TurnstileAPIServer:
         
         return elements
 
+    async def _find_and_click_checkbox(self, page, index: int):
+        """Найти и кликнуть по чекбоксу Turnstile CAPTCHA внутри iframe"""
+        try:
+            # Пробуем разные селекторы iframe с защитой от ошибок
+            iframe_selectors = [
+                'iframe[src*="challenges.cloudflare.com"]',
+                'iframe[src*="turnstile"]',
+                'iframe[title*="widget"]'
+            ]
+            
+            iframe_locator = None
+            for selector in iframe_selectors:
+                try:
+                    test_locator = page.locator(selector).first
+                    # Безопасная проверка count для iframe
+                    try:
+                        iframe_count = await test_locator.count()
+                    except Exception:
+                        iframe_count = 0
+                        
+                    if iframe_count > 0:
+                        iframe_locator = test_locator
+                        if self.debug:
+                            logger.debug(f"Browser {index}: Found Turnstile iframe with selector: {selector}")
+                        break
+                except Exception as e:
+                    if self.debug:
+                        logger.debug(f"Browser {index}: Iframe selector '{selector}' failed: {str(e)}")
+                    continue
+            
+            if iframe_locator:
+                try:
+                    # Получаем frame из iframe
+                    iframe_element = await iframe_locator.element_handle()
+                    frame = await iframe_element.content_frame()
+                    
+                    if frame:
+                        # Ищем чекбокс внутри iframe
+                        checkbox_selectors = [
+                            'input[type="checkbox"]',
+                            '.cb-lb input[type="checkbox"]',
+                            'label input[type="checkbox"]'
+                        ]
+                        
+                        for selector in checkbox_selectors:
+                            try:
+                                # Полностью избегаем locator.count() в iframe - используем альтернативный подход
+                                try:
+                                    # Пробуем кликнуть напрямую без count проверки
+                                    checkbox = frame.locator(selector).first
+                                    await checkbox.click(timeout=2000)
+                                    if self.debug:
+                                        logger.debug(f"Browser {index}: Successfully clicked checkbox in iframe with selector '{selector}'")
+                                    return True
+                                except Exception as click_e:
+                                    # Если прямой клик не сработал, записываем в debug но не падаем
+                                    if self.debug:
+                                        logger.debug(f"Browser {index}: Direct checkbox click failed for '{selector}': {str(click_e)}")
+                                    continue
+                            except Exception as e:
+                                if self.debug:
+                                    logger.debug(f"Browser {index}: Iframe checkbox selector '{selector}' failed: {str(e)}")
+                                continue
+                    
+                        # Если нашли iframe, но не смогли кликнуть чекбокс, пробуем клик по iframe
+                        try:
+                            if self.debug:
+                                logger.debug(f"Browser {index}: Trying to click iframe directly as fallback")
+                            await iframe_locator.click(timeout=1000)
+                            return True
+                        except Exception as e:
+                            if self.debug:
+                                logger.debug(f"Browser {index}: Iframe direct click failed: {str(e)}")
+                
+                except Exception as e:
+                    if self.debug:
+                        logger.debug(f"Browser {index}: Failed to access iframe content: {str(e)}")
+            
+        except Exception as e:
+            if self.debug:
+                logger.debug(f"Browser {index}: General iframe search failed: {str(e)}")
+        
+        return False
+
     async def _try_click_strategies(self, page, index: int):
         strategies = [
-
-            ('xpath_click', lambda: page.locator("//div[@class='cf-turnstile']").click(timeout=1000))
+            ('checkbox_click', lambda: self._find_and_click_checkbox(page, index)),
+            ('direct_widget', lambda: self._safe_click(page, '.cf-turnstile', index)),
+            ('iframe_click', lambda: self._safe_click(page, 'iframe[src*="turnstile"]', index)),
+            ('js_click', lambda: page.evaluate("document.querySelector('.cf-turnstile')?.click()")),
+            ('sitekey_attr', lambda: self._safe_click(page, '[data-sitekey]', index)),
+            ('any_turnstile', lambda: self._safe_click(page, '*[class*="turnstile"]', index)),
+            ('xpath_click', lambda: self._safe_click(page, "//div[@class='cf-turnstile']", index))
         ]
         
         for strategy_name, strategy_func in strategies:
             try:
-                await strategy_func()
-                if self.debug:
-                    logger.debug(f"Browser {index}: Click strategy '{strategy_name}' succeeded")
-                return True
+                result = await strategy_func()
+                if result is True or result is None:  # None означает успех для большинства стратегий
+                    if self.debug:
+                        logger.debug(f"Browser {index}: Click strategy '{strategy_name}' succeeded")
+                    return True
             except Exception as e:
                 if self.debug:
                     logger.debug(f"Browser {index}: Click strategy '{strategy_name}' failed: {str(e)}")
                 continue
         
         return False
+
+    async def _safe_click(self, page, selector: str, index: int):
+        """Полностью безопасный клик с максимальной защитой от ошибок"""
+        try:
+            # Пробуем кликнуть напрямую без count() проверки
+            locator = page.locator(selector).first
+            await locator.click(timeout=1000)
+            return True
+        except Exception as e:
+            # Логируем ошибку только в debug режиме
+            if self.debug and "Can't query n-th element" not in str(e):
+                logger.debug(f"Browser {index}: Safe click failed for '{selector}': {str(e)}")
+            return False
 
     async def _load_captcha_overlay(self, page, websiteKey: str, action: str = '', index: int = 0):
         script = f"""
@@ -370,6 +487,7 @@ class TurnstileAPIServer:
             logger.debug(f"Browser {index}: Created CAPTCHA overlay with sitekey: {websiteKey}")
 
     async def _solve_turnstile(self, task_id: str, url: str, sitekey: str, action: Optional[str] = None, cdata: Optional[str] = None):
+        """Solve the Turnstile challenge."""
         proxy = None
 
         index, browser, browser_config = await self.browser_pool.get()
@@ -527,44 +645,85 @@ class TurnstileAPIServer:
 
             await self._unblock_rendering(page)
 
-            found_elements = await self._find_turnstile_elements(page, index)
-            
-            if self.debug:
-                logger.debug(f"Browser {index}: Found Turnstile elements: {found_elements}")
-
-            if not found_elements:
-                if self.debug:
-                    logger.debug(f"Browser {index}: No existing Turnstile found, creating overlay with sitekey: {sitekey}")
-                
-                await self._load_captcha_overlay(page, sitekey, action or '', index)
+            # Ждем немного времени для загрузки CAPTCHA
+            await asyncio.sleep(3)
 
             locator = page.locator('input[name="cf-turnstile-response"]')
             max_attempts = 20 
             
             for attempt in range(max_attempts):
                 try:
-                    token = await locator.input_value(timeout=500)
-                    if token:
-                        elapsed_time = round(time.time() - start_time, 3)
-                        logger.success(f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds")
-                        await save_result(task_id, "turnstile", {"value": token, "elapsed_time": elapsed_time})
-                        return
+                    # Безопасная проверка количества элементов с токеном
+                    try:
+                        count = await locator.count()
+                    except Exception as e:
+                        if self.debug:
+                            logger.debug(f"Browser {index}: Locator count failed on attempt {attempt + 1}: {str(e)}")
+                        count = 0
                     
-                    if attempt % 3 == 0:
+                    if count == 0:
+                        if self.debug:
+                            logger.debug(f"Browser {index}: No token elements found on attempt {attempt + 1}")
+                    elif count == 1:
+                        # Если только один элемент, проверяем его токен
+                        try:
+                            token = await locator.input_value(timeout=500)
+                            if token:
+                                elapsed_time = round(time.time() - start_time, 3)
+                                logger.success(f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds")
+                                await save_result(task_id, "turnstile", {"value": token, "elapsed_time": elapsed_time})
+                                return
+                        except Exception as e:
+                            if self.debug:
+                                logger.debug(f"Browser {index}: Single token element check failed: {str(e)}")
+                    else:
+                        # Если несколько элементов, проверяем все по очереди
+                        if self.debug:
+                            logger.debug(f"Browser {index}: Found {count} token elements, checking all")
+                        
+                        for i in range(count):
+                            try:
+                                element_token = await locator.nth(i).input_value(timeout=500)
+                                if element_token:
+                                    elapsed_time = round(time.time() - start_time, 3)
+                                    logger.success(f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{element_token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds")
+                                    await save_result(task_id, "turnstile", {"value": element_token, "elapsed_time": elapsed_time})
+                                    return
+                            except Exception as e:
+                                if self.debug:
+                                    logger.debug(f"Browser {index}: Token element {i} check failed: {str(e)}")
+                                continue
+                    
+                    # Клик стратегии только каждые 3 попытки и не сразу
+                    if attempt > 2 and attempt % 3 == 0:
                         click_success = await self._try_click_strategies(page, index)
                         if not click_success and self.debug:
                             logger.debug(f"Browser {index}: All click strategies failed on attempt {attempt + 1}")
                     
-                    if attempt == 10 and not token:
-                        if self.debug:
-                            logger.debug(f"Browser {index}: Creating overlay as fallback strategy")
-                        await self._load_captcha_overlay(page, sitekey, action or '', index)
-                        await asyncio.sleep(2)
+                    # Fallback overlay на 10 попытке если токена все еще нет
+                    if attempt == 10:
+                        try:
+                            # Безопасная проверка count для overlay
+                            try:
+                                current_count = await locator.count()
+                            except Exception:
+                                current_count = 0
+                                
+                            if current_count == 0:
+                                if self.debug:
+                                    logger.debug(f"Browser {index}: Creating overlay as fallback strategy")
+                                await self._load_captcha_overlay(page, sitekey, action or '', index)
+                                await asyncio.sleep(2)
+                        except Exception as e:
+                            if self.debug:
+                                logger.debug(f"Browser {index}: Fallback overlay creation failed: {str(e)}")
+                    
+                    # Адаптивное ожидание
                     wait_time = min(0.5 + (attempt * 0.05), 2.0)
                     await asyncio.sleep(wait_time)
                     
                     if self.debug and attempt % 5 == 0:
-                        logger.debug(f"Browser {index}: Attempt {attempt + 1}/{max_attempts} - No token yet")
+                        logger.debug(f"Browser {index}: Attempt {attempt + 1}/{max_attempts} - No valid token yet")
                         
                 except Exception as e:
                     if self.debug:
