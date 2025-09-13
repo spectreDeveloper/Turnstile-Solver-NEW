@@ -287,15 +287,21 @@ class TurnstileAPIServer:
             
             # Add IPv6 arguments if IPv6 is enabled
             if self.ipv6_support and SUBNETS_IPV6:
-                browser_args.extend([
+                # Universal IPv6 arguments that work for both Playwright and Camoufox
+                ipv6_args = [
                     "--enable-ipv6",
+                    "--disable-ipv4", 
                     "--force-ipv6",
-                    "--disable-ipv4",
-                    "--prefer-ipv6",
-                    "--dns-prefetch-disable"
-                ])
+                    "--host-resolver-rules=EXCLUDE localhost,EXCLUDE 127.0.0.1,EXCLUDE ::1",
+                    "--dns-over-https-mode=secure",
+                    "--dns-over-https-templates=https://dns.google/dns-query{?dns}",
+                    "--disable-features=VizDisplayCompositor",
+                    "--disable-dev-shm-usage",
+                    "--no-sandbox"
+                ]
+                browser_args.extend(ipv6_args)
                 if self.debug:
-                    logger.debug(f"Browser {i+1}: Added IPv6 arguments to browser initialization")
+                    logger.debug(f"Browser {i+1}: Added IPv6 arguments to browser initialization - FORCING IPv6 ONLY")
             elif self.ipv6_support and not SUBNETS_IPV6:
                 if self.debug:
                     logger.warning(f"Browser {i+1}: IPv6 enabled but no valid subnets - browser will use regular IP")
@@ -308,7 +314,13 @@ class TurnstileAPIServer:
                     args=browser_args
                 )
             elif self.browser_type == "camoufox" and camoufox:
-                browser = await camoufox.start()
+                # Pass IPv6 arguments to Camoufox as well
+                if self.ipv6_support and SUBNETS_IPV6:
+                    browser = await camoufox.start(args=browser_args)
+                    if self.debug:
+                        logger.debug(f"Browser {i+1}: Camoufox started with IPv6 arguments")
+                else:
+                    browser = await camoufox.start()
 
             if browser:
                 await self.browser_pool.put((i+1, browser, config))
@@ -749,38 +761,10 @@ class TurnstileAPIServer:
             if self.debug:
                 logger.debug(f"Browser {index}: Generated IPv6 address: {ipv6_address}")
                 logger.debug(f"Browser {index}: Available IPv6 subnets: {', '.join(SUBNETS_IPV6)}")
-                logger.debug(f"Browser {index}: IPv6 support active - browser configured to prefer IPv6 connections")
-            try:
-                # For browsers that support it, add IPv6-related arguments
-                if hasattr(browser, 'browser_type') or 'chromium' in str(type(browser)).lower():
-                    # Add IPv6 preference arguments
-                    browser_args = [
-                        '--enable-ipv6',
-                        '--force-ipv6',
-                        '--dns-prefetch-disable',
-                        '--host-resolver-rules=MAP * 0.0.0.0,EXCLUDE localhost'
-                    ]
-                    
-                    # Try to add arguments to existing browser if possible
-                    if hasattr(browser, '_process') and hasattr(browser._process, 'args'):
-                        # Extend existing args if browser supports it
-                        if self.debug:
-                            logger.debug(f"Browser {index}: Added IPv6 arguments to browser")
-                    else:
-                        if self.debug:
-                            logger.debug(f"Browser {index}: IPv6 arguments prepared for next browser instance")
-                
-                if self.debug:
-                    logger.debug(f"Browser {index}: IPv6 support configured - browser will prefer IPv6 connections")
-            except Exception as e:
-                if self.debug:
-                    logger.debug(f"Browser {index}: Could not configure IPv6 arguments: {e}")
+                logger.debug(f"Browser {index}: IPv6 support active - browser forced to IPv6 only mode")
         elif self.ipv6_support and not SUBNETS_IPV6:
             if self.debug:
                 logger.warning(f"Browser {index}: IPv6 enabled but no valid subnets configured - falling back to regular IP")
-        else:
-            if self.debug:
-                logger.debug(f"Browser {index}: IPv6 not enabled - using default IP resolution")
 
         page = await context.new_page()
         
