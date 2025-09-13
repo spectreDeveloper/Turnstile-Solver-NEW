@@ -384,6 +384,47 @@ class TurnstileAPIServer:
         """Разблокировка рендеринга"""
         await page.unroute("**/*", self._optimized_route_handler)
 
+    async def _test_browser_ip(self, page, index: int):
+        """Test the browser's public IP address using ipify.org"""
+        try:
+            if self.debug:
+                logger.debug(f"Browser {index}: Testing public IP address...")
+            
+            # Navigate to ipify.org to get the public IP
+            await page.goto("https://api.ipify.org?format=json", wait_until="networkidle", timeout=10000)
+            
+            # Extract the IP from the page content
+            content = await page.text_content("body")
+            
+            # Try to parse JSON response
+            try:
+                import json
+                ip_data = json.loads(content.strip())
+                ip_address = ip_data.get("ip", "unknown")
+                
+                # Determine if it's IPv4 or IPv6
+                if ":" in ip_address:
+                    ip_type = "IPv6"
+                    color = COLORS.get('GREEN')
+                else:
+                    ip_type = "IPv4" 
+                    color = COLORS.get('BLUE')
+                
+                logger.info(f"Browser {index}: Public IP - {color}{ip_address}{COLORS.get('RESET')} ({ip_type})")
+                
+                if self.ipv6_support and ip_type == "IPv4":
+                    logger.warning(f"Browser {index}: IPv6 enabled but using IPv4 address - check network configuration")
+                elif self.ipv6_support and ip_type == "IPv6":
+                    logger.info(f"Browser {index}: Successfully using IPv6 address as configured")
+                    
+            except json.JSONDecodeError as e:
+                logger.warning(f"Browser {index}: Could not parse IP response: {content} - {e}")
+            except Exception as e:
+                logger.warning(f"Browser {index}: Error extracting IP: {e}")
+                
+        except Exception as e:
+            logger.warning(f"Browser {index}: Failed to test public IP: {e}")
+
     async def _find_turnstile_elements(self, page, index: int):
         """Умная проверка всех возможных Turnstile элементов"""
         selectors = [
@@ -739,6 +780,10 @@ class TurnstileAPIServer:
                 logger.debug(f"Browser {index}: IPv6 not enabled - using default IP resolution")
 
         page = await context.new_page()
+        
+        # Test IP address if IPv6 is enabled or debug is active
+        if self.ipv6_support or self.debug:
+            await self._test_browser_ip(page, index)
         
         await self._antishadow_inject(page)
         
