@@ -1,8 +1,7 @@
-version: '3.8'
-
 services:
   turnstile-solver:
     build: .
+    network_mode: host
     ports:
       - "${PORT:-5072}:${PORT:-5072}"
     volumes:

@@ -413,9 +413,10 @@ class TurnstileAPIServer:
                 logger.info(f"Browser {index}: Public IP - {color}{ip_address}{COLORS.get('RESET')} ({ip_type})")
                 
                 if self.ipv6_support and ip_type == "IPv4":
-                    logger.warning(f"Browser {index}: IPv6 enabled but using IPv4 address - check network configuration")
+                    logger.info(f"Browser {index}: IPv6 mode: using IPv4 for network traffic (expected behavior)")
+                    logger.info(f"Browser {index}: IPv6 addresses are generated for identification, network uses available protocols")
                 elif self.ipv6_support and ip_type == "IPv6":
-                    logger.info(f"Browser {index}: Successfully using IPv6 address as configured")
+                    logger.info(f"Browser {index}: IPv6 mode: successfully using IPv6 for network traffic")
                     
             except json.JSONDecodeError as e:
                 logger.warning(f"Browser {index}: Could not parse IP response: {content} - {e}")
