@@ -2,6 +2,10 @@ services:
   turnstile-solver:
     build: .
     network_mode: host
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=0
+      - net.ipv6.conf.default.disable_ipv6=0
+      - net.ipv6.conf.lo.disable_ipv6=0
     ports:
       - "${PORT:-5072}:${PORT:-5072}"
     volumes:
