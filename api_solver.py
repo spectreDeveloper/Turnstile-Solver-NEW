@@ -289,10 +289,8 @@ class TurnstileAPIServer:
             if self.ipv6_support and SUBNETS_IPV6:
                 browser_args.extend([
                     "--enable-ipv6",
-                    "--disable-ipv4",
-                    "--host-resolver-rules=MAP * [::1],EXCLUDE localhost",
-                    "--force-ipv6-connectivity-check",
-                    "--disable-features=PrivateNetworkAccessSendPreflights"
+                    "--dns-over-https-mode=secure",
+                    "--dns-over-https-templates=https://cloudflare-dns.com/dns-query"
                 ])
                 if self.debug:
                     logger.debug(f"Browser {i+1}: Added IPv6 arguments to browser initialization")
@@ -386,32 +384,40 @@ class TurnstileAPIServer:
         """Разблокировка рендеринга"""
         await page.unroute("**/*", self._optimized_route_handler)
 
+    async def _test_system_ipv6_connectivity(self):
+        """Test if the system has working IPv6 connectivity"""
+        try:
+            import socket
+            import asyncio
+            
+            # Try to connect to Google's IPv6 DNS server
+            sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            
+            # Try connecting to Google's IPv6 DNS
+            result = sock.connect_ex(("2001:4860:4860::8888", 53))
+            sock.close()
+            
+            return result == 0
+        except Exception:
+            return False
+
     async def _test_browser_ip(self, page, index: int):
         """Test the browser's public IP address using ipify.org"""
         try:
             if self.debug:
                 logger.debug(f"Browser {index}: Testing public IP address...")
             
-            # First try IPv6-specific service if IPv6 is enabled
+            # Test system IPv6 connectivity first if IPv6 is enabled
             if self.ipv6_support:
-                try:
-                    # Try IPv6-only service first
-                    await page.goto("https://api6.ipify.org?format=json", wait_until="networkidle", timeout=15000)
-                    content = await page.text_content("body")
-                    
-                    import json
-                    ip_data = json.loads(content.strip())
-                    ip_address = ip_data.get("ip", "unknown")
-                    
-                    if ip_address != "unknown" and ":" in ip_address:
-                        logger.info(f"Browser {index}: Public IP - {COLORS.get('GREEN')}{ip_address}{COLORS.get('RESET')} (IPv6)")
-                        logger.info(f"Browser {index}: Successfully using IPv6 for network traffic!")
-                        return
-                except Exception as ipv6_error:
-                    if self.debug:
-                        logger.debug(f"Browser {index}: IPv6 service test failed: {ipv6_error}")
+                ipv6_working = await self._test_system_ipv6_connectivity()
+                if self.debug:
+                    logger.debug(f"Browser {index}: System IPv6 connectivity: {'Working' if ipv6_working else 'Not working'}")
+                
+                if not ipv6_working:
+                    logger.warning(f"Browser {index}: IPv6 is enabled but system has no IPv6 connectivity")
             
-            # Fallback to regular ipify service
+            # Use the regular ipify service which supports both IPv4 and IPv6
             await page.goto("https://api.ipify.org?format=json", wait_until="networkidle", timeout=10000)
             
             # Extract the IP from the page content
@@ -771,29 +777,6 @@ class TurnstileAPIServer:
                 logger.debug(f"Browser {index}: IPv6 support active - browser configured to prefer IPv6 connections")
         
         page = await context.new_page()
-        
-        # Force IPv6 at protocol level if enabled
-        if self.ipv6_support and SUBNETS_IPV6:
-            try:
-                # Get CDP session to configure network
-                cdp_session = await context.new_cdp_session(page)
-                
-                # Enable network domain
-                await cdp_session.send("Network.enable")
-                
-                # Set DNS configuration to prefer IPv6
-                await cdp_session.send("Network.setUserAgentOverride", {
-                    "userAgent": context_options.get('user_agent', ''),
-                    "acceptLanguage": "en-US,en;q=0.9",
-                    "platform": "Linux x86_64"
-                })
-                
-                if self.debug:
-                    logger.debug(f"Browser {index}: IPv6 network configuration applied via CDP")
-                    
-            except Exception as e:
-                if self.debug:
-                    logger.debug(f"Browser {index}: Could not configure IPv6 via CDP: {e}")
         
         # Test IP address if IPv6 is enabled or debug is active
         if self.ipv6_support or self.debug:
