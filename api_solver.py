@@ -96,10 +96,29 @@ class CustomLogger(logging.Logger):
 
 
 logging.setLoggerClass(CustomLogger)
+
+# Create logger with proper initialization
 logger = logging.getLogger("TurnstileAPIServer")
 logger.setLevel(logging.DEBUG)
+
+# Remove any existing handlers to avoid duplicates
+for handler in logger.handlers[:]:
+    logger.removeHandler(handler)
+
+# Add new handler
 handler = logging.StreamHandler(sys.stdout)
+handler.setLevel(logging.DEBUG)
 logger.addHandler(handler)
+
+# Ensure logger is properly configured
+logger.propagate = False
+
+def safe_log_success(message, *args, **kwargs):
+    """Safely log success message with fallback to info if success method not available."""
+    if hasattr(logger, 'success'):
+        logger.success(message, *args, **kwargs)
+    else:
+        logger.info(f"[SUCCESS] {message}", *args, **kwargs)
 
 
 class TurnstileAPIServer:
@@ -781,7 +800,8 @@ class TurnstileAPIServer:
                             token = await locator.input_value(timeout=500)
                             if token:
                                 elapsed_time = round(time.time() - start_time, 3)
-                                logger.success(f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds")
+                                success_msg = f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds"
+                                safe_log_success(success_msg)
                                 await save_result(task_id, "turnstile", {"value": token, "elapsed_time": elapsed_time})
                                 return
                         except Exception as e:
@@ -797,7 +817,8 @@ class TurnstileAPIServer:
                                 element_token = await locator.nth(i).input_value(timeout=500)
                                 if element_token:
                                     elapsed_time = round(time.time() - start_time, 3)
-                                    logger.success(f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{element_token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds")
+                                    success_msg = f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{element_token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds"
+                                    safe_log_success(success_msg)
                                     await save_result(task_id, "turnstile", {"value": element_token, "elapsed_time": elapsed_time})
                                     return
                             except Exception as e:
