@@ -289,8 +289,10 @@ class TurnstileAPIServer:
             if self.ipv6_support and SUBNETS_IPV6:
                 browser_args.extend([
                     "--enable-ipv6",
-                    "--force-ipv6",
-                    "--dns-prefetch-disable"
+                    "--disable-ipv4",
+                    "--host-resolver-rules=MAP * [::1],EXCLUDE localhost",
+                    "--force-ipv6-connectivity-check",
+                    "--disable-features=PrivateNetworkAccessSendPreflights"
                 ])
                 if self.debug:
                     logger.debug(f"Browser {i+1}: Added IPv6 arguments to browser initialization")
@@ -390,7 +392,26 @@ class TurnstileAPIServer:
             if self.debug:
                 logger.debug(f"Browser {index}: Testing public IP address...")
             
-            # Navigate to ipify.org to get the public IP
+            # First try IPv6-specific service if IPv6 is enabled
+            if self.ipv6_support:
+                try:
+                    # Try IPv6-only service first
+                    await page.goto("https://api6.ipify.org?format=json", wait_until="networkidle", timeout=15000)
+                    content = await page.text_content("body")
+                    
+                    import json
+                    ip_data = json.loads(content.strip())
+                    ip_address = ip_data.get("ip", "unknown")
+                    
+                    if ip_address != "unknown" and ":" in ip_address:
+                        logger.info(f"Browser {index}: Public IP - {COLORS.get('GREEN')}{ip_address}{COLORS.get('RESET')} (IPv6)")
+                        logger.info(f"Browser {index}: Successfully using IPv6 for network traffic!")
+                        return
+                except Exception as ipv6_error:
+                    if self.debug:
+                        logger.debug(f"Browser {index}: IPv6 service test failed: {ipv6_error}")
+            
+            # Fallback to regular ipify service
             await page.goto("https://api.ipify.org?format=json", wait_until="networkidle", timeout=10000)
             
             # Extract the IP from the page content
@@ -413,10 +434,10 @@ class TurnstileAPIServer:
                 logger.info(f"Browser {index}: Public IP - {color}{ip_address}{COLORS.get('RESET')} ({ip_type})")
                 
                 if self.ipv6_support and ip_type == "IPv4":
-                    logger.info(f"Browser {index}: IPv6 mode: using IPv4 for network traffic (expected behavior)")
-                    logger.info(f"Browser {index}: IPv6 addresses are generated for identification, network uses available protocols")
+                    logger.warning(f"Browser {index}: IPv6 configured but still using IPv4 - network/DNS may not support IPv6")
+                    logger.info(f"Browser {index}: Check that your network and DNS servers support IPv6")
                 elif self.ipv6_support and ip_type == "IPv6":
-                    logger.info(f"Browser {index}: IPv6 mode: successfully using IPv6 for network traffic")
+                    logger.info(f"Browser {index}: Successfully using IPv6 for network traffic!")
                     
             except json.JSONDecodeError as e:
                 logger.warning(f"Browser {index}: Could not parse IP response: {content} - {e}")
@@ -748,39 +769,31 @@ class TurnstileAPIServer:
                 logger.debug(f"Browser {index}: Generated IPv6 address: {ipv6_address}")
                 logger.debug(f"Browser {index}: Available IPv6 subnets: {', '.join(SUBNETS_IPV6)}")
                 logger.debug(f"Browser {index}: IPv6 support active - browser configured to prefer IPv6 connections")
+        
+        page = await context.new_page()
+        
+        # Force IPv6 at protocol level if enabled
+        if self.ipv6_support and SUBNETS_IPV6:
             try:
-                # For browsers that support it, add IPv6-related arguments
-                if hasattr(browser, 'browser_type') or 'chromium' in str(type(browser)).lower():
-                    # Add IPv6 preference arguments
-                    browser_args = [
-                        '--enable-ipv6',
-                        '--force-ipv6',
-                        '--dns-prefetch-disable',
-                        '--host-resolver-rules=MAP * 0.0.0.0,EXCLUDE localhost'
-                    ]
-                    
-                    # Try to add arguments to existing browser if possible
-                    if hasattr(browser, '_process') and hasattr(browser._process, 'args'):
-                        # Extend existing args if browser supports it
-                        if self.debug:
-                            logger.debug(f"Browser {index}: Added IPv6 arguments to browser")
-                    else:
-                        if self.debug:
-                            logger.debug(f"Browser {index}: IPv6 arguments prepared for next browser instance")
+                # Get CDP session to configure network
+                cdp_session = await context.new_cdp_session(page)
+                
+                # Enable network domain
+                await cdp_session.send("Network.enable")
+                
+                # Set DNS configuration to prefer IPv6
+                await cdp_session.send("Network.setUserAgentOverride", {
+                    "userAgent": context_options.get('user_agent', ''),
+                    "acceptLanguage": "en-US,en;q=0.9",
+                    "platform": "Linux x86_64"
+                })
                 
                 if self.debug:
-                    logger.debug(f"Browser {index}: IPv6 support configured - browser will prefer IPv6 connections")
+                    logger.debug(f"Browser {index}: IPv6 network configuration applied via CDP")
+                    
             except Exception as e:
                 if self.debug:
-                    logger.debug(f"Browser {index}: Could not configure IPv6 arguments: {e}")
-        elif self.ipv6_support and not SUBNETS_IPV6:
-            if self.debug:
-                logger.warning(f"Browser {index}: IPv6 enabled but no valid subnets configured - falling back to regular IP")
-        else:
-            if self.debug:
-                logger.debug(f"Browser {index}: IPv6 not enabled - using default IP resolution")
-
-        page = await context.new_page()
+                    logger.debug(f"Browser {index}: Could not configure IPv6 via CDP: {e}")
         
         # Test IP address if IPv6 is enabled or debug is active
         if self.ipv6_support or self.debug:
