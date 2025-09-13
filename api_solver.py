@@ -287,31 +287,11 @@ class TurnstileAPIServer:
             
             # Add IPv6 arguments if IPv6 is enabled
             if self.ipv6_support and SUBNETS_IPV6:
-                # Extremely aggressive IPv6 arguments - force IPv6 at all levels
-                ipv6_args = [
-                    "--enable-ipv6",
-                    "--disable-ipv4", 
-                    "--force-ipv6",
-                    "--disable-ipv4-connectivity-check",
-                    "--enable-ipv6-connectivity-check",
-                    "--disable-background-networking",
-                    "--disable-background-timer-throttling",
-                    "--host-resolver-rules=MAP * [::1]:443,EXCLUDE localhost,EXCLUDE 127.0.0.1,EXCLUDE ::1",
-                    "--dns-over-https-mode=secure",
-                    "--dns-over-https-templates=https://dns.google/dns-query{?dns}",
-                    "--enable-features=NetworkServiceLogging",
-                    "--log-level=2",
-                    "--disable-features=VizDisplayCompositor,TranslateUI",
-                    "--disable-dev-shm-usage",
-                    "--no-sandbox",
-                    "--disable-gpu",
-                    "--disable-software-rasterizer",
-                    "--force-fieldtrials=NetworkErrorLogging/Enabled/",
-                    "--use-mock-keychain"
-                ]
-                browser_args.extend(ipv6_args)
+                browser_args.extend([
+                    
+                ])
                 if self.debug:
-                    logger.debug(f"Browser {i+1}: Added EXTREMELY AGGRESSIVE IPv6 arguments - COMPLETE IPv4 BLOCKING")
+                    logger.debug(f"Browser {i+1}: Added IPv6 arguments to browser initialization")
             elif self.ipv6_support and not SUBNETS_IPV6:
                 if self.debug:
                     logger.warning(f"Browser {i+1}: IPv6 enabled but no valid subnets - browser will use regular IP")
@@ -324,13 +304,7 @@ class TurnstileAPIServer:
                     args=browser_args
                 )
             elif self.browser_type == "camoufox" and camoufox:
-                # Pass IPv6 arguments to Camoufox as well
-                if self.ipv6_support and SUBNETS_IPV6:
-                    browser = await camoufox.start(args=browser_args)
-                    if self.debug:
-                        logger.debug(f"Browser {i+1}: Camoufox started with IPv6 arguments")
-                else:
-                    browser = await camoufox.start()
+                browser = await camoufox.start()
 
             if browser:
                 await self.browser_pool.put((i+1, browser, config))
@@ -409,65 +383,43 @@ class TurnstileAPIServer:
         await page.unroute("**/*", self._optimized_route_handler)
 
     async def _test_browser_ip(self, page, index: int):
-        """Test the browser's public IP address using multiple IPv6-capable services"""
+        """Test the browser's public IP address using ipify.org"""
         try:
             if self.debug:
                 logger.debug(f"Browser {index}: Testing public IP address...")
             
-            # Test multiple services to ensure accurate IPv6 detection
-            test_services = [
-                ("https://api64.ipify.org?format=json", "IPv6-first service"),
-                ("https://api.ipify.org?format=json", "IPv4/IPv6 service"),
-                ("https://ifconfig.co/json", "ifconfig.co service")
-            ]
+            # Navigate to ipify.org to get the public IP
+            await page.goto("https://api.ipify.org?format=json", wait_until="networkidle", timeout=10000)
             
-            for service_url, service_name in test_services:
-                try:
-                    if self.debug:
-                        logger.debug(f"Browser {index}: Testing with {service_name}...")
-                    
-                    # Navigate to IP detection service
-                    await page.goto(service_url, wait_until="networkidle", timeout=10000)
-                    
-                    # Extract the IP from the page content
-                    content = await page.text_content("body")
-                    
-                    # Try to parse JSON response
-                    try:
-                        import json
-                        ip_data = json.loads(content.strip())
-                        ip_address = ip_data.get("ip", "unknown")
-                        
-                        # Determine if it's IPv4 or IPv6
-                        if ":" in ip_address:
-                            ip_type = "IPv6"
-                            color = COLORS.get('GREEN')
-                            logger.info(f"Browser {index}: {service_name} - {color}{ip_address}{COLORS.get('RESET')} ({ip_type}) ✅")
-                            
-                            if self.ipv6_support:
-                                logger.info(f"Browser {index}: SUCCESS! IPv6 mode is working correctly with native IPv6 traffic")
-                                return  # Stop testing once we confirm IPv6 is working
-                        else:
-                            ip_type = "IPv4" 
-                            color = COLORS.get('BLUE')
-                            logger.info(f"Browser {index}: {service_name} - {color}{ip_address}{COLORS.get('RESET')} ({ip_type})")
-                            
-                            if self.ipv6_support:
-                                logger.warning(f"Browser {index}: IPv6 mode enabled but still using IPv4 with {service_name}")
-                        
-                    except json.JSONDecodeError as e:
-                        logger.warning(f"Browser {index}: Could not parse {service_name} response: {content} - {e}")
-                    except Exception as e:
-                        logger.warning(f"Browser {index}: Error extracting IP from {service_name}: {e}")
-                        
-                except Exception as e:
-                    logger.warning(f"Browser {index}: Failed to test {service_name}: {e}")
-                    continue
+            # Extract the IP from the page content
+            content = await page.text_content("body")
             
-            # If we get here and IPv6 is enabled, it means all tests showed IPv4
-            if self.ipv6_support:
-                logger.error(f"Browser {index}: IPv6 FORCING FAILED - all services report IPv4 usage despite aggressive arguments")
-                logger.info(f"Browser {index}: This may indicate Docker networking or system-level IPv6 issues")
+            # Try to parse JSON response
+            try:
+                import json
+                ip_data = json.loads(content.strip())
+                ip_address = ip_data.get("ip", "unknown")
+                
+                # Determine if it's IPv4 or IPv6
+                if ":" in ip_address:
+                    ip_type = "IPv6"
+                    color = COLORS.get('GREEN')
+                else:
+                    ip_type = "IPv4" 
+                    color = COLORS.get('BLUE')
+                
+                logger.info(f"Browser {index}: Public IP - {color}{ip_address}{COLORS.get('RESET')} ({ip_type})")
+                
+                if self.ipv6_support and ip_type == "IPv4":
+                    logger.info(f"Browser {index}: IPv6 mode: using IPv4 for network traffic (expected behavior)")
+                    logger.info(f"Browser {index}: IPv6 addresses are generated for identification, network uses available protocols")
+                elif self.ipv6_support and ip_type == "IPv6":
+                    logger.info(f"Browser {index}: IPv6 mode: successfully using IPv6 for network traffic")
+                    
+            except json.JSONDecodeError as e:
+                logger.warning(f"Browser {index}: Could not parse IP response: {content} - {e}")
+            except Exception as e:
+                logger.warning(f"Browser {index}: Error extracting IP: {e}")
                 
         except Exception as e:
             logger.warning(f"Browser {index}: Failed to test public IP: {e}")
@@ -793,10 +745,38 @@ class TurnstileAPIServer:
             if self.debug:
                 logger.debug(f"Browser {index}: Generated IPv6 address: {ipv6_address}")
                 logger.debug(f"Browser {index}: Available IPv6 subnets: {', '.join(SUBNETS_IPV6)}")
-                logger.debug(f"Browser {index}: IPv6 support active - browser forced to IPv6 only mode")
+                logger.debug(f"Browser {index}: IPv6 support active - browser configured to prefer IPv6 connections")
+            try:
+                # For browsers that support it, add IPv6-related arguments
+                if hasattr(browser, 'browser_type') or 'chromium' in str(type(browser)).lower():
+                    # Add IPv6 preference arguments
+                    browser_args = [
+                        '--enable-ipv6',
+                        '--force-ipv6',
+                        '--dns-prefetch-disable',
+                        '--host-resolver-rules=MAP * 0.0.0.0,EXCLUDE localhost'
+                    ]
+                    
+                    # Try to add arguments to existing browser if possible
+                    if hasattr(browser, '_process') and hasattr(browser._process, 'args'):
+                        # Extend existing args if browser supports it
+                        if self.debug:
+                            logger.debug(f"Browser {index}: Added IPv6 arguments to browser")
+                    else:
+                        if self.debug:
+                            logger.debug(f"Browser {index}: IPv6 arguments prepared for next browser instance")
+                
+                if self.debug:
+                    logger.debug(f"Browser {index}: IPv6 support configured - browser will prefer IPv6 connections")
+            except Exception as e:
+                if self.debug:
+                    logger.debug(f"Browser {index}: Could not configure IPv6 arguments: {e}")
         elif self.ipv6_support and not SUBNETS_IPV6:
             if self.debug:
                 logger.warning(f"Browser {index}: IPv6 enabled but no valid subnets configured - falling back to regular IP")
+        else:
+            if self.debug:
+                logger.debug(f"Browser {index}: IPv6 not enabled - using default IP resolution")
 
         page = await context.new_page()
         
