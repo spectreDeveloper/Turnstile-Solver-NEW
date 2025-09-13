@@ -19,4 +19,5 @@ services:
       - THREAD=${THREAD:-4}
       - USERAGENT=${USERAGENT:-}
       - NO_HEADLESS=${NO_HEADLESS:-false}
+      - IPV6_SUBNETS=${IPV6_SUBNETS}
     restart: unless-stopped
