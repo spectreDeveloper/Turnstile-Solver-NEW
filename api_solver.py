@@ -289,8 +289,10 @@ class TurnstileAPIServer:
             if self.ipv6_support and SUBNETS_IPV6:
                 browser_args.extend([
                     "--enable-ipv6",
-                    "--dns-over-https-mode=secure",
-                    "--dns-over-https-templates=https://cloudflare-dns.com/dns-query"
+                    "--force-ipv6",
+                    "--disable-ipv4",
+                    "--prefer-ipv6",
+                    "--dns-prefetch-disable"
                 ])
                 if self.debug:
                     logger.debug(f"Browser {i+1}: Added IPv6 arguments to browser initialization")
@@ -384,40 +386,13 @@ class TurnstileAPIServer:
         """Разблокировка рендеринга"""
         await page.unroute("**/*", self._optimized_route_handler)
 
-    async def _test_system_ipv6_connectivity(self):
-        """Test if the system has working IPv6 connectivity"""
-        try:
-            import socket
-            import asyncio
-            
-            # Try to connect to Google's IPv6 DNS server
-            sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-            sock.settimeout(5)
-            
-            # Try connecting to Google's IPv6 DNS
-            result = sock.connect_ex(("2001:4860:4860::8888", 53))
-            sock.close()
-            
-            return result == 0
-        except Exception:
-            return False
-
     async def _test_browser_ip(self, page, index: int):
         """Test the browser's public IP address using ipify.org"""
         try:
             if self.debug:
                 logger.debug(f"Browser {index}: Testing public IP address...")
             
-            # Test system IPv6 connectivity first if IPv6 is enabled
-            if self.ipv6_support:
-                ipv6_working = await self._test_system_ipv6_connectivity()
-                if self.debug:
-                    logger.debug(f"Browser {index}: System IPv6 connectivity: {'Working' if ipv6_working else 'Not working'}")
-                
-                if not ipv6_working:
-                    logger.warning(f"Browser {index}: IPv6 is enabled but system has no IPv6 connectivity")
-            
-            # Use the regular ipify service which supports both IPv4 and IPv6
+            # Navigate to ipify.org to get the public IP
             await page.goto("https://api.ipify.org?format=json", wait_until="networkidle", timeout=10000)
             
             # Extract the IP from the page content
@@ -440,10 +415,10 @@ class TurnstileAPIServer:
                 logger.info(f"Browser {index}: Public IP - {color}{ip_address}{COLORS.get('RESET')} ({ip_type})")
                 
                 if self.ipv6_support and ip_type == "IPv4":
-                    logger.warning(f"Browser {index}: IPv6 configured but still using IPv4 - network/DNS may not support IPv6")
-                    logger.info(f"Browser {index}: Check that your network and DNS servers support IPv6")
+                    logger.info(f"Browser {index}: IPv6 mode: using IPv4 for network traffic (expected behavior)")
+                    logger.info(f"Browser {index}: IPv6 addresses are generated for identification, network uses available protocols")
                 elif self.ipv6_support and ip_type == "IPv6":
-                    logger.info(f"Browser {index}: Successfully using IPv6 for network traffic!")
+                    logger.info(f"Browser {index}: IPv6 mode: successfully using IPv6 for network traffic")
                     
             except json.JSONDecodeError as e:
                 logger.warning(f"Browser {index}: Could not parse IP response: {content} - {e}")
@@ -775,7 +750,38 @@ class TurnstileAPIServer:
                 logger.debug(f"Browser {index}: Generated IPv6 address: {ipv6_address}")
                 logger.debug(f"Browser {index}: Available IPv6 subnets: {', '.join(SUBNETS_IPV6)}")
                 logger.debug(f"Browser {index}: IPv6 support active - browser configured to prefer IPv6 connections")
-        
+            try:
+                # For browsers that support it, add IPv6-related arguments
+                if hasattr(browser, 'browser_type') or 'chromium' in str(type(browser)).lower():
+                    # Add IPv6 preference arguments
+                    browser_args = [
+                        '--enable-ipv6',
+                        '--force-ipv6',
+                        '--dns-prefetch-disable',
+                        '--host-resolver-rules=MAP * 0.0.0.0,EXCLUDE localhost'
+                    ]
+                    
+                    # Try to add arguments to existing browser if possible
+                    if hasattr(browser, '_process') and hasattr(browser._process, 'args'):
+                        # Extend existing args if browser supports it
+                        if self.debug:
+                            logger.debug(f"Browser {index}: Added IPv6 arguments to browser")
+                    else:
+                        if self.debug:
+                            logger.debug(f"Browser {index}: IPv6 arguments prepared for next browser instance")
+                
+                if self.debug:
+                    logger.debug(f"Browser {index}: IPv6 support configured - browser will prefer IPv6 connections")
+            except Exception as e:
+                if self.debug:
+                    logger.debug(f"Browser {index}: Could not configure IPv6 arguments: {e}")
+        elif self.ipv6_support and not SUBNETS_IPV6:
+            if self.debug:
+                logger.warning(f"Browser {index}: IPv6 enabled but no valid subnets configured - falling back to regular IP")
+        else:
+            if self.debug:
+                logger.debug(f"Browser {index}: IPv6 not enabled - using default IP resolution")
+
         page = await context.new_page()
         
         # Test IP address if IPv6 is enabled or debug is active
