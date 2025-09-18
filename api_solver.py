@@ -229,8 +229,7 @@ class TurnstileAPIServer:
             await self._initialize_browser()
             
             # Запускаем периодическую очистку старых результатов
-            loop = asyncio.get_event_loop()
-            loop.create_task(self._periodic_cleanup())
+            asyncio.create_task(self._periodic_cleanup())
             
         except Exception as e:
             logger.error(f"Failed to initialize browser: {str(e)}")
@@ -268,59 +267,61 @@ class TurnstileAPIServer:
         for i in range(self.thread_count):
             config = browser_configs[i]
 
-            chrome_options = uc.ChromeOptions()
-            chrome_options.add_argument("--window-position=0,0")
-            chrome_options.add_argument("--force-device-scale-factor=1")
-            chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-            chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-            chrome_options.add_experimental_option('useAutomationExtension', False)
+            def create_chrome_options():
+                """Create fresh Chrome options for each attempt"""
+                options = uc.ChromeOptions()
+                options.add_argument("--window-position=0,0")
+                options.add_argument("--force-device-scale-factor=1")
+                options.add_argument("--disable-blink-features=AutomationControlled")
 
-            # Docker compatibility arguments
-            chrome_options.add_argument("--no-sandbox")
-            chrome_options.add_argument("--disable-dev-shm-usage")
-            chrome_options.add_argument("--disable-gpu")
-            chrome_options.add_argument("--disable-extensions")
-            chrome_options.add_argument("--disable-plugins")
-            chrome_options.add_argument("--disable-images")
-            chrome_options.add_argument("--disable-web-security")
-            chrome_options.add_argument("--ignore-certificate-errors")
-            chrome_options.add_argument("--ignore-ssl-errors")
-            chrome_options.add_argument("--ignore-certificate-errors-spki-list")
-            chrome_options.add_argument("--disable-background-timer-throttling")
-            chrome_options.add_argument("--disable-renderer-backgrounding")
-            chrome_options.add_argument("--disable-backgrounding-occluded-windows")
+                # Docker compatibility arguments
+                options.add_argument("--no-sandbox")
+                options.add_argument("--disable-dev-shm-usage")
+                options.add_argument("--disable-gpu")
+                options.add_argument("--disable-extensions")
+                options.add_argument("--disable-plugins")
+                options.add_argument("--disable-images")
+                options.add_argument("--disable-web-security")
+                options.add_argument("--ignore-certificate-errors")
+                options.add_argument("--ignore-ssl-errors")
+                options.add_argument("--ignore-certificate-errors-spki-list")
+                options.add_argument("--disable-background-timer-throttling")
+                options.add_argument("--disable-renderer-backgrounding")
+                options.add_argument("--disable-backgrounding-occluded-windows")
 
-            if self.headless:
-                chrome_options.add_argument("--headless=new")
+                if self.headless:
+                    options.add_argument("--headless=new")
 
-            if config['useragent']:
-                chrome_options.add_argument(f"--user-agent={config['useragent']}")
+                if config['useragent']:
+                    options.add_argument(f"--user-agent={config['useragent']}")
 
-            # Add IPv6 arguments if IPv6 is enabled
-            if self.ipv6_support and SUBNETS_IPV6:
-                chrome_options.add_argument("--enable-ipv6")
-                chrome_options.add_argument("--dns-prefetch-disable")
-                chrome_options.add_argument("--host-resolver-rules=MAP * 0.0.0.0,EXCLUDE localhost")
-                # Force IPv6 preference
-                chrome_options.add_argument("--force-ipv6")
-                if self.debug:
-                    logger.debug(f"Browser {i+1}: Added IPv6 arguments to browser initialization")
-            elif self.ipv6_support and not SUBNETS_IPV6:
-                if self.debug:
-                    logger.warning(f"Browser {i+1}: IPv6 enabled but no valid subnets - browser will use regular IP")
+                # Add IPv6 arguments if IPv6 is enabled
+                if self.ipv6_support and SUBNETS_IPV6:
+                    options.add_argument("--enable-ipv6")
+                    options.add_argument("--dns-prefetch-disable")
+                    options.add_argument("--host-resolver-rules=MAP * 0.0.0.0,EXCLUDE localhost")
+                    # Force IPv6 preference
+                    options.add_argument("--force-ipv6")
+                    if self.debug:
+                        logger.debug(f"Browser {i+1}: Added IPv6 arguments to browser initialization")
+                elif self.ipv6_support and not SUBNETS_IPV6:
+                    if self.debug:
+                        logger.warning(f"Browser {i+1}: IPv6 enabled but no valid subnets - browser will use regular IP")
+
+                return options
 
             browser = None
             try:
                 # Try different configurations for better Docker compatibility
                 try:
                     # First attempt: Standard undetected chrome
-                    browser = uc.Chrome(options=chrome_options, version_main=None)
+                    browser = uc.Chrome(options=create_chrome_options(), version_main=None)
                 except Exception as e1:
                     logger.debug(f"Browser {i+1}: First Chrome attempt failed: {e1}")
                     try:
                         # Second attempt: With explicit paths disabled
                         browser = uc.Chrome(
-                            options=chrome_options,
+                            options=create_chrome_options(),
                             driver_executable_path=None,
                             browser_executable_path=None,
                             version_main=None
@@ -329,13 +330,13 @@ class TurnstileAPIServer:
                         logger.debug(f"Browser {i+1}: Second Chrome attempt failed: {e2}")
                         try:
                             # Third attempt: Minimal configuration
-                            browser = uc.Chrome(options=chrome_options)
+                            browser = uc.Chrome(options=create_chrome_options())
                         except Exception as e3:
                             logger.debug(f"Browser {i+1}: Third Chrome attempt failed: {e3}")
                             try:
                                 # Final fallback: Regular Selenium WebDriver
                                 logger.info(f"Browser {i+1}: Falling back to regular Selenium WebDriver")
-                                browser = webdriver.Chrome(options=chrome_options)
+                                browser = webdriver.Chrome(options=create_chrome_options())
                             except Exception as e4:
                                 logger.error(f"Browser {i+1}: All Chrome attempts failed (including fallback): {e4}")
                                 browser = None
@@ -434,7 +435,8 @@ class TurnstileAPIServer:
                     logger.warning(f"Browser {index}: Failed to test IP: {e}")
 
             # Run in background thread
-            await asyncio.get_event_loop().run_in_executor(None, test_ip)
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, test_ip)
 
         except Exception as e:
             logger.warning(f"Browser {index}: Failed to test public IP: {e}")
@@ -468,7 +470,8 @@ class TurnstileAPIServer:
 
             return elements
 
-        return await asyncio.get_event_loop().run_in_executor(None, find_elements)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, find_elements)
 
     async def _find_and_click_checkbox(self, driver, index: int):
         """Selenium-based iframe and checkbox handling"""
@@ -549,7 +552,8 @@ class TurnstileAPIServer:
 
             return False
 
-        return await asyncio.get_event_loop().run_in_executor(None, click_checkbox)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, click_checkbox)
 
     async def _safe_click(self, driver, selector: str, index: int):
         """Selenium-based safe click"""
@@ -570,7 +574,8 @@ class TurnstileAPIServer:
                     logger.debug(f"Browser {index}: Safe click failed for '{selector}': {str(e)}")
             return False
 
-        return await asyncio.get_event_loop().run_in_executor(None, safe_click)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, safe_click)
 
     async def _js_click(self, driver, index: int):
         """JavaScript click execution"""
@@ -583,7 +588,8 @@ class TurnstileAPIServer:
                     logger.debug(f"Browser {index}: JS click failed: {str(e)}")
                 return False
 
-        return await asyncio.get_event_loop().run_in_executor(None, js_click)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, js_click)
 
     async def _try_click_strategies(self, driver, index: int):
         strategies = [
@@ -650,10 +656,17 @@ class TurnstileAPIServer:
             if self.debug:
                 logger.debug(f"Browser {index}: Created CAPTCHA overlay with sitekey: {websiteKey}")
 
-        await asyncio.get_event_loop().run_in_executor(None, create_overlay)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, create_overlay)
 
     async def _solve_turnstile(self, task_id: str, url: str, sitekey: str, action: Optional[str] = None, cdata: Optional[str] = None):
         """Solve the Turnstile challenge."""
+        # Check if browser pool is empty
+        if self.browser_pool.qsize() == 0:
+            logger.error("No browsers available in pool - all browser initialization failed")
+            await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": 0})
+            return
+
         index, browser, browser_config = await self.browser_pool.get()
 
         try:
@@ -704,7 +717,8 @@ class TurnstileAPIServer:
                     if self.debug:
                         logger.debug(f"Browser {index}: Could not set window size: {e}")
 
-            await asyncio.get_event_loop().run_in_executor(None, set_window_size)
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, set_window_size)
 
         start_time = time.time()
 
@@ -719,20 +733,23 @@ class TurnstileAPIServer:
             def navigate_to_url():
                 browser.get(url)
 
-            await asyncio.get_event_loop().run_in_executor(None, navigate_to_url)
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, navigate_to_url)
 
             # Wait for page to load
             await asyncio.sleep(3)
 
             max_attempts = 20
 
+            # Define find_token_elements outside the loop to avoid redefinition
+            def find_token_elements():
+                return browser.find_elements(By.CSS_SELECTOR, 'input[name="cf-turnstile-response"]')
+
             for attempt in range(max_attempts):
                 try:
                     # Find token elements using Selenium
-                    def find_token_elements():
-                        return browser.find_elements(By.CSS_SELECTOR, 'input[name="cf-turnstile-response"]')
-
-                    token_elements = await asyncio.get_event_loop().run_in_executor(None, find_token_elements)
+                    loop = asyncio.get_running_loop()
+                    token_elements = await loop.run_in_executor(None, find_token_elements)
                     count = len(token_elements)
 
                     if count == 0:
@@ -744,7 +761,8 @@ class TurnstileAPIServer:
                             def get_token_value():
                                 return token_elements[0].get_attribute('value')
 
-                            token = await asyncio.get_event_loop().run_in_executor(None, get_token_value)
+                            loop = asyncio.get_running_loop()
+                            token = await loop.run_in_executor(None, get_token_value)
                             if token:
                                 elapsed_time = round(time.time() - start_time, 3)
                                 success_msg = f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds"
@@ -764,7 +782,8 @@ class TurnstileAPIServer:
                                 def get_element_token(idx):
                                     return token_elements[idx].get_attribute('value')
 
-                                element_token = await asyncio.get_event_loop().run_in_executor(None, get_element_token, i)
+                                loop = asyncio.get_running_loop()
+                                element_token = await loop.run_in_executor(None, get_element_token, i)
                                 if element_token:
                                     elapsed_time = round(time.time() - start_time, 3)
                                     success_msg = f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{element_token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds"
@@ -785,7 +804,8 @@ class TurnstileAPIServer:
                     # Fallback overlay on attempt 10
                     if attempt == 10:
                         try:
-                            current_count = len(await asyncio.get_event_loop().run_in_executor(None, find_token_elements))
+                            loop = asyncio.get_running_loop()
+                            current_count = len(await loop.run_in_executor(None, find_token_elements))
                             if current_count == 0:
                                 if self.debug:
                                     logger.debug(f"Browser {index}: Creating overlay as fallback strategy")
@@ -865,8 +885,7 @@ class TurnstileAPIServer:
 
         try:
             # Create task in the current event loop
-            loop = asyncio.get_event_loop()
-            loop.create_task(self._solve_turnstile(task_id=task_id, url=url, sitekey=sitekey, action=action, cdata=cdata))
+            asyncio.create_task(self._solve_turnstile(task_id=task_id, url=url, sitekey=sitekey, action=action, cdata=cdata))
 
             if self.debug:
                 logger.debug(f"Request completed with taskid {task_id}.")
