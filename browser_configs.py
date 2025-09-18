@@ -64,18 +64,16 @@ class BrowserConfig:
     def get_random_browser_config(self, browser_type=None) -> Tuple[str, str, str, str]:
         """
         Get random browser configuration
-        
+
         Args:
-            browser_type: Browser type for filtering (chrome, chromium, camoufox)
-            
+            browser_type: Browser type for filtering (chrome, chromium, msedge)
+
         Returns:
             Tuple[str, str, str, str]: (browser_name, version, user_agent, sec_ch_ua)
         """
         if browser_type in ['chrome', 'chromium', 'msedge', 'avast']:
             chromium_browsers = ['chrome', 'edge', 'avast', 'brave']
             browser = random.choice(chromium_browsers)
-        elif browser_type == 'camoufox':
-            return 'firefox', 'custom', '', ''
         else:
             browser = random.choice(self.available_browsers)
             

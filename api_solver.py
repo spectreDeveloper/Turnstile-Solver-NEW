@@ -8,7 +8,6 @@ import asyncio
 from typing import Optional
 import argparse
 from quart import Quart, request, jsonify
-from camoufox.async_api import AsyncCamoufox
 import undetected_chromedriver as uc
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -239,33 +238,22 @@ class TurnstileAPIServer:
 
     async def _initialize_browser(self) -> None:
         """Initialize the browser and create the page pool."""
-        camoufox = None
-
-        if self.browser_type == "camoufox":
-            camoufox = AsyncCamoufox(headless=self.headless)
 
         browser_configs = []
         for _ in range(self.thread_count):
-            if self.browser_type in ['chromium', 'chrome', 'msedge']:
-                if self.use_random_config:
-                    browser, version, useragent, sec_ch_ua = browser_config.get_random_browser_config(self.browser_type)
-                elif self.browser_name and self.browser_version:
-                    config = browser_config.get_browser_config(self.browser_name, self.browser_version)
-                    if config:
-                        useragent, sec_ch_ua = config
-                        browser = self.browser_name
-                        version = self.browser_version
-                    else:
-                        browser, version, useragent, sec_ch_ua = browser_config.get_random_browser_config(self.browser_type)
+            if self.use_random_config:
+                browser, version, useragent, sec_ch_ua = browser_config.get_random_browser_config(self.browser_type)
+            elif self.browser_name and self.browser_version:
+                config = browser_config.get_browser_config(self.browser_name, self.browser_version)
+                if config:
+                    useragent, sec_ch_ua = config
+                    browser = self.browser_name
+                    version = self.browser_version
                 else:
-                    browser = getattr(self, 'browser_name', 'custom')
-                    version = getattr(self, 'browser_version', 'custom')
-                    useragent = self.useragent
-                    sec_ch_ua = getattr(self, 'sec_ch_ua', '')
+                    browser, version, useragent, sec_ch_ua = browser_config.get_random_browser_config(self.browser_type)
             else:
-                # Для camoufox и других браузеров используем значения по умолчанию
-                browser = self.browser_type
-                version = 'custom'
+                browser = getattr(self, 'browser_name', 'custom')
+                version = getattr(self, 'browser_version', 'custom')
                 useragent = self.useragent
                 sec_ch_ua = getattr(self, 'sec_ch_ua', '')
 
@@ -322,63 +310,55 @@ class TurnstileAPIServer:
                     logger.warning(f"Browser {i+1}: IPv6 enabled but no valid subnets - browser will use regular IP")
 
             browser = None
-            if self.browser_type in ['chromium', 'chrome', 'msedge']:
+            try:
+                # Try different configurations for better Docker compatibility
                 try:
-                    # Try different configurations for better Docker compatibility
+                    # First attempt: Standard undetected chrome
+                    browser = uc.Chrome(options=chrome_options, version_main=None)
+                except Exception as e1:
+                    logger.debug(f"Browser {i+1}: First Chrome attempt failed: {e1}")
                     try:
-                        # First attempt: Standard undetected chrome
-                        browser = uc.Chrome(options=chrome_options, version_main=None)
-                    except Exception as e1:
-                        logger.debug(f"Browser {i+1}: First Chrome attempt failed: {e1}")
+                        # Second attempt: With explicit paths disabled
+                        browser = uc.Chrome(
+                            options=chrome_options,
+                            driver_executable_path=None,
+                            browser_executable_path=None,
+                            version_main=None
+                        )
+                    except Exception as e2:
+                        logger.debug(f"Browser {i+1}: Second Chrome attempt failed: {e2}")
                         try:
-                            # Second attempt: With explicit paths disabled
-                            browser = uc.Chrome(
-                                options=chrome_options,
-                                driver_executable_path=None,
-                                browser_executable_path=None,
-                                version_main=None
-                            )
-                        except Exception as e2:
-                            logger.debug(f"Browser {i+1}: Second Chrome attempt failed: {e2}")
+                            # Third attempt: Minimal configuration
+                            browser = uc.Chrome(options=chrome_options)
+                        except Exception as e3:
+                            logger.debug(f"Browser {i+1}: Third Chrome attempt failed: {e3}")
                             try:
-                                # Third attempt: Minimal configuration
-                                browser = uc.Chrome(options=chrome_options)
-                            except Exception as e3:
-                                logger.debug(f"Browser {i+1}: Third Chrome attempt failed: {e3}")
-                                try:
-                                    # Final fallback: Regular Selenium WebDriver
-                                    logger.info(f"Browser {i+1}: Falling back to regular Selenium WebDriver")
-                                    browser = webdriver.Chrome(options=chrome_options)
-                                except Exception as e4:
-                                    logger.error(f"Browser {i+1}: All Chrome attempts failed (including fallback): {e4}")
-                                    browser = None
+                                # Final fallback: Regular Selenium WebDriver
+                                logger.info(f"Browser {i+1}: Falling back to regular Selenium WebDriver")
+                                browser = webdriver.Chrome(options=chrome_options)
+                            except Exception as e4:
+                                logger.error(f"Browser {i+1}: All Chrome attempts failed (including fallback): {e4}")
+                                browser = None
 
-                    if browser:
-                        # Execute script to remove webdriver property
-                        try:
-                            browser.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+                if browser:
+                    # Execute script to remove webdriver property
+                    try:
+                        browser.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
-                            # Add chrome runtime
-                            browser.execute_script("""
-                                window.chrome = {
-                                    runtime: {},
-                                    loadTimes: function() {},
-                                    csi: function() {},
-                                };
-                            """)
-                        except Exception as e:
-                            logger.warning(f"Browser {i+1}: Failed to execute anti-detection scripts: {e}")
+                        # Add chrome runtime
+                        browser.execute_script("""
+                            window.chrome = {
+                                runtime: {},
+                                loadTimes: function() {},
+                                csi: function() {},
+                            };
+                        """)
+                    except Exception as e:
+                        logger.warning(f"Browser {i+1}: Failed to execute anti-detection scripts: {e}")
 
-                except Exception as e:
-                    logger.error(f"Browser {i+1}: Critical Chrome driver initialization failure: {e}")
-                    browser = None
-
-            elif self.browser_type == "camoufox" and camoufox:
-                try:
-                    browser = await camoufox.start()
-                except Exception as e:
-                    logger.error(f"Browser {i+1}: Failed to initialize Camoufox: {e}")
-                    browser = None
+            except Exception as e:
+                logger.error(f"Browser {i+1}: Critical Chrome driver initialization failure: {e}")
+                browser = None
 
             if browser:
                 await self.browser_pool.put((i+1, browser, config))
@@ -1011,7 +991,7 @@ def parse_args():
     parser.add_argument('--no-headless', action='store_true', help='Run the browser with GUI (disable headless mode). By default, headless mode is enabled.')
     parser.add_argument('--useragent', type=str, help='User-Agent string (if not specified, random configuration is used)')
     parser.add_argument('--debug', action='store_true', help='Enable or disable debug mode for additional logging and troubleshooting information (default: False)')
-    parser.add_argument('--browser_type', type=str, default='chromium', help='Specify the browser type for the solver. Supported options: chromium, chrome, msedge, camoufox (default: chromium)')
+    parser.add_argument('--browser_type', type=str, default='chromium', help='Specify the browser type for the solver. Supported options: chromium, chrome, msedge (default: chromium)')
     parser.add_argument('--thread', type=int, default=4, help='Set the number of browser threads to use for multi-threaded mode. Increasing this will speed up execution but requires more resources (default: 1)')
     parser.add_argument('--proxy', action='store_true', help='Enable proxy support for the solver (Default: False)')
     parser.add_argument('--ipv6', action='store_true', help='Enable IPv6 support for the solver (Default: False)')
@@ -1034,7 +1014,6 @@ if __name__ == '__main__':
         'chromium',
         'chrome',
         'msedge',
-        'camoufox',
     ]
     if args.browser_type not in browser_types:
         logger.error(f"Unknown browser type: {COLORS.get('RED')}{args.browser_type}{COLORS.get('RESET')} Available browser types: {browser_types}")

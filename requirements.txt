@@ -3,7 +3,6 @@ asyncio
 argparse
 undetected-chromedriver
 selenium
-camoufox[geoip]
 requests
 aiosqlite
 rich
