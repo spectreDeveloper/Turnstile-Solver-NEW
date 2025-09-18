@@ -10,8 +10,10 @@ import argparse
 from quart import Quart, request, jsonify
 from camoufox.async_api import AsyncCamoufox
 import undetected_chromedriver as uc
+from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.chrome.service import Service
 from db_results import init_db, save_result, load_result, cleanup_old_results
 from browser_configs import browser_config
 from rich.console import Console
@@ -228,7 +230,8 @@ class TurnstileAPIServer:
             await self._initialize_browser()
             
             # Запускаем периодическую очистку старых результатов
-            asyncio.create_task(self._periodic_cleanup())
+            loop = asyncio.get_event_loop()
+            loop.create_task(self._periodic_cleanup())
             
         except Exception as e:
             logger.error(f"Failed to initialize browser: {str(e)}")
@@ -284,6 +287,21 @@ class TurnstileAPIServer:
             chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
             chrome_options.add_experimental_option('useAutomationExtension', False)
 
+            # Docker compatibility arguments
+            chrome_options.add_argument("--no-sandbox")
+            chrome_options.add_argument("--disable-dev-shm-usage")
+            chrome_options.add_argument("--disable-gpu")
+            chrome_options.add_argument("--disable-extensions")
+            chrome_options.add_argument("--disable-plugins")
+            chrome_options.add_argument("--disable-images")
+            chrome_options.add_argument("--disable-web-security")
+            chrome_options.add_argument("--ignore-certificate-errors")
+            chrome_options.add_argument("--ignore-ssl-errors")
+            chrome_options.add_argument("--ignore-certificate-errors-spki-list")
+            chrome_options.add_argument("--disable-background-timer-throttling")
+            chrome_options.add_argument("--disable-renderer-backgrounding")
+            chrome_options.add_argument("--disable-backgrounding-occluded-windows")
+
             if self.headless:
                 chrome_options.add_argument("--headless=new")
 
@@ -306,38 +324,68 @@ class TurnstileAPIServer:
             browser = None
             if self.browser_type in ['chromium', 'chrome', 'msedge']:
                 try:
-                    # Create undetected chrome driver with proper configuration
-                    browser = uc.Chrome(
-                        options=chrome_options,
-                        version_main=None,
-                        driver_executable_path=None,
-                        browser_executable_path=None
-                    )
+                    # Try different configurations for better Docker compatibility
+                    try:
+                        # First attempt: Standard undetected chrome
+                        browser = uc.Chrome(options=chrome_options, version_main=None)
+                    except Exception as e1:
+                        logger.debug(f"Browser {i+1}: First Chrome attempt failed: {e1}")
+                        try:
+                            # Second attempt: With explicit paths disabled
+                            browser = uc.Chrome(
+                                options=chrome_options,
+                                driver_executable_path=None,
+                                browser_executable_path=None,
+                                version_main=None
+                            )
+                        except Exception as e2:
+                            logger.debug(f"Browser {i+1}: Second Chrome attempt failed: {e2}")
+                            try:
+                                # Third attempt: Minimal configuration
+                                browser = uc.Chrome(options=chrome_options)
+                            except Exception as e3:
+                                logger.debug(f"Browser {i+1}: Third Chrome attempt failed: {e3}")
+                                try:
+                                    # Final fallback: Regular Selenium WebDriver
+                                    logger.info(f"Browser {i+1}: Falling back to regular Selenium WebDriver")
+                                    browser = webdriver.Chrome(options=chrome_options)
+                                except Exception as e4:
+                                    logger.error(f"Browser {i+1}: All Chrome attempts failed (including fallback): {e4}")
+                                    browser = None
 
-                    # Execute script to remove webdriver property
-                    browser.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+                    if browser:
+                        # Execute script to remove webdriver property
+                        try:
+                            browser.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
-                    # Add chrome runtime
-                    browser.execute_script("""
-                        window.chrome = {
-                            runtime: {},
-                            loadTimes: function() {},
-                            csi: function() {},
-                        };
-                    """)
+                            # Add chrome runtime
+                            browser.execute_script("""
+                                window.chrome = {
+                                    runtime: {},
+                                    loadTimes: function() {},
+                                    csi: function() {},
+                                };
+                            """)
+                        except Exception as e:
+                            logger.warning(f"Browser {i+1}: Failed to execute anti-detection scripts: {e}")
 
                 except Exception as e:
-                    logger.error(f"Failed to initialize Chrome driver: {e}")
+                    logger.error(f"Browser {i+1}: Critical Chrome driver initialization failure: {e}")
                     browser = None
 
             elif self.browser_type == "camoufox" and camoufox:
-                browser = await camoufox.start()
+                try:
+                    browser = await camoufox.start()
+                except Exception as e:
+                    logger.error(f"Browser {i+1}: Failed to initialize Camoufox: {e}")
+                    browser = None
 
             if browser:
                 await self.browser_pool.put((i+1, browser, config))
-
-            if self.debug:
-                logger.info(f"Browser {i + 1} initialized successfully with {config['browser_name']} {config['browser_version']}")
+                if self.debug:
+                    logger.info(f"Browser {i + 1} initialized successfully with {config['browser_name']} {config['browser_version']}")
+            else:
+                logger.warning(f"Browser {i + 1} failed to initialize - skipping")
 
         logger.info(f"Browser pool initialized with {self.browser_pool.qsize()} browsers")
 
@@ -836,7 +884,9 @@ class TurnstileAPIServer:
         })
 
         try:
-            asyncio.create_task(self._solve_turnstile(task_id=task_id, url=url, sitekey=sitekey, action=action, cdata=cdata))
+            # Create task in the current event loop
+            loop = asyncio.get_event_loop()
+            loop.create_task(self._solve_turnstile(task_id=task_id, url=url, sitekey=sitekey, action=action, cdata=cdata))
 
             if self.debug:
                 logger.debug(f"Request completed with taskid {task_id}.")
