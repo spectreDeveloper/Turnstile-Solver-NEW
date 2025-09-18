@@ -555,8 +555,126 @@ class TurnstileAPIServer:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, click_checkbox)
 
+    async def _check_browser_health(self, driver, index: int) -> bool:
+        """Check if browser session is still healthy"""
+        def health_check():
+            try:
+                # Try to get current URL - this will fail if session is dead
+                driver.current_url
+                # Try a simple script execution
+                driver.execute_script("return document.readyState")
+                return True
+            except Exception:
+                return False
+
+        loop = asyncio.get_running_loop()
+        try:
+            return await asyncio.wait_for(
+                loop.run_in_executor(None, health_check),
+                timeout=5.0
+            )
+        except asyncio.TimeoutError:
+            return False
+
+    async def _recreate_browser(self, index: int, config: dict):
+        """Recreate a browser with the same configuration"""
+        def create_chrome_options():
+            """Create fresh Chrome options for each attempt"""
+            options = uc.ChromeOptions()
+            options.add_argument("--window-position=0,0")
+            options.add_argument("--force-device-scale-factor=1")
+            options.add_argument("--disable-blink-features=AutomationControlled")
+
+            # Docker compatibility arguments
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--disable-extensions")
+            options.add_argument("--disable-plugins")
+            options.add_argument("--disable-images")
+            options.add_argument("--disable-web-security")
+            options.add_argument("--ignore-certificate-errors")
+            options.add_argument("--ignore-ssl-errors")
+            options.add_argument("--ignore-certificate-errors-spki-list")
+            options.add_argument("--disable-background-timer-throttling")
+            options.add_argument("--disable-renderer-backgrounding")
+            options.add_argument("--disable-backgrounding-occluded-windows")
+
+            if self.headless:
+                options.add_argument("--headless=new")
+
+            if config['useragent']:
+                options.add_argument(f"--user-agent={config['useragent']}")
+
+            # Add IPv6 arguments if IPv6 is enabled
+            if self.ipv6_support and SUBNETS_IPV6:
+                options.add_argument("--enable-ipv6")
+                options.add_argument("--dns-prefetch-disable")
+                options.add_argument("--disable-ipv6")
+                options.add_argument("--enable-experimental-web-platform-features")
+
+            return options
+
+        if self.debug:
+            logger.debug(f"Browser {index}: Recreating browser due to connection failure")
+
+        browser = None
+        try:
+            # Try primary approach with undetected-chromedriver
+            try:
+                browser = uc.Chrome(options=create_chrome_options())
+            except Exception as e1:
+                logger.debug(f"Browser {index}: First Chrome attempt failed: {e1}")
+                try:
+                    # Second attempt: With explicit paths disabled
+                    browser = uc.Chrome(
+                        options=create_chrome_options(),
+                        driver_executable_path=None,
+                        browser_executable_path=None,
+                        version_main=None
+                    )
+                except Exception as e2:
+                    logger.debug(f"Browser {index}: Second Chrome attempt failed: {e2}")
+                    try:
+                        # Third attempt: Minimal configuration
+                        browser = uc.Chrome(options=create_chrome_options())
+                    except Exception as e3:
+                        logger.debug(f"Browser {index}: Third Chrome attempt failed: {e3}")
+                        try:
+                            # Final fallback: Regular Selenium WebDriver
+                            logger.info(f"Browser {index}: Falling back to regular Selenium WebDriver")
+                            browser = webdriver.Chrome(options=create_chrome_options())
+                        except Exception as e4:
+                            logger.error(f"Browser {index}: All Chrome attempts failed: {e4}")
+                            return None
+
+            if browser:
+                # Execute script to remove webdriver property
+                try:
+                    browser.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
+                    # Add chrome runtime
+                    browser.execute_script("""
+                        window.chrome = {
+                            runtime: {},
+                            loadTimes: function() {},
+                            csi: function() {},
+                        };
+                    """)
+                except Exception as e:
+                    logger.warning(f"Browser {index}: Failed to execute anti-detection scripts: {e}")
+
+                if self.debug:
+                    logger.debug(f"Browser {index}: Successfully recreated browser")
+                return browser
+        except Exception as e:
+            logger.error(f"Browser {index}: Failed to recreate browser: {e}")
+            return None
+
+        return None
+
     async def _safe_click(self, driver, selector: str, index: int):
-        """Selenium-based safe click"""
+        """Selenium-based safe click with connection health check"""
         def safe_click():
             try:
                 if selector.startswith("//"):
@@ -572,13 +690,28 @@ class TurnstileAPIServer:
             except Exception as e:
                 if self.debug and "Can't query n-th element" not in str(e):
                     logger.debug(f"Browser {index}: Safe click failed for '{selector}': {str(e)}")
+                # Re-raise connection-related exceptions
+                if any(msg in str(e).lower() for msg in ['connection', 'refused', 'disconnected', 'session']):
+                    raise
             return False
 
+        # Check browser health first
+        if not await self._check_browser_health(driver, index):
+            raise Exception("Browser session is unhealthy or disconnected")
+
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, safe_click)
+        try:
+            return await asyncio.wait_for(
+                loop.run_in_executor(None, safe_click),
+                timeout=10.0
+            )
+        except asyncio.TimeoutError:
+            if self.debug:
+                logger.debug(f"Browser {index}: Safe click timeout for '{selector}'")
+            return False
 
     async def _js_click(self, driver, index: int):
-        """JavaScript click execution"""
+        """JavaScript click execution with health check"""
         def js_click():
             try:
                 driver.execute_script("document.querySelector('.cf-turnstile')?.click()")
@@ -586,10 +719,25 @@ class TurnstileAPIServer:
             except Exception as e:
                 if self.debug:
                     logger.debug(f"Browser {index}: JS click failed: {str(e)}")
+                # Re-raise connection-related exceptions
+                if any(msg in str(e).lower() for msg in ['connection', 'refused', 'disconnected', 'session']):
+                    raise
                 return False
 
+        # Check browser health first
+        if not await self._check_browser_health(driver, index):
+            raise Exception("Browser session is unhealthy or disconnected")
+
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, js_click)
+        try:
+            return await asyncio.wait_for(
+                loop.run_in_executor(None, js_click),
+                timeout=10.0
+            )
+        except asyncio.TimeoutError:
+            if self.debug:
+                logger.debug(f"Browser {index}: JS click timeout")
+            return False
 
     async def _try_click_strategies(self, driver, index: int):
         strategies = [
@@ -721,6 +869,7 @@ class TurnstileAPIServer:
             await loop.run_in_executor(None, set_window_size)
 
         start_time = time.time()
+        self._browser_recreated = False  # Flag to track if browser was recreated this session
 
         try:
             if self.debug:
@@ -729,12 +878,18 @@ class TurnstileAPIServer:
             if self.debug:
                 logger.debug(f"Browser {index}: Loading real website directly: {url}")
 
-            # Navigate to the target URL using Selenium
+            # Navigate to the target URL using Selenium with timeout
             def navigate_to_url():
                 browser.get(url)
 
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, navigate_to_url)
+            try:
+                await asyncio.wait_for(
+                    loop.run_in_executor(None, navigate_to_url),
+                    timeout=30.0
+                )
+            except asyncio.TimeoutError:
+                raise Exception("Navigation timeout - browser may be unresponsive")
 
             # Wait for page to load
             await asyncio.sleep(3)
@@ -823,8 +978,39 @@ class TurnstileAPIServer:
                         logger.debug(f"Browser {index}: Attempt {attempt + 1}/{max_attempts} - No valid token yet")
 
                 except Exception as e:
-                    if self.debug:
-                        logger.debug(f"Browser {index}: Attempt {attempt + 1} error: {str(e)}")
+                    error_msg = str(e).lower()
+                    # Check if this is a connection-related error that requires browser recreation
+                    if any(msg in error_msg for msg in ['connection', 'refused', 'disconnected', 'session', 'timeout']):
+                        if self.debug:
+                            logger.warning(f"Browser {index}: Connection error detected on attempt {attempt + 1}: {str(e)}")
+
+                        # Try to recreate the browser once per solve attempt
+                        if not hasattr(self, '_browser_recreated') or not self._browser_recreated:
+                            self._browser_recreated = True
+                            if self.debug:
+                                logger.debug(f"Browser {index}: Attempting to recreate browser due to connection failure")
+
+                            new_browser = await self._recreate_browser(index, browser_config)
+                            if new_browser:
+                                browser = new_browser
+                                if self.debug:
+                                    logger.debug(f"Browser {index}: Browser recreation successful, continuing solve attempt")
+                                # Reset navigation after browser recreation
+                                try:
+                                    def navigate_to_url():
+                                        browser.get(url)
+                                    loop = asyncio.get_running_loop()
+                                    await loop.run_in_executor(None, navigate_to_url)
+                                    await asyncio.sleep(3)
+                                except Exception as nav_e:
+                                    if self.debug:
+                                        logger.warning(f"Browser {index}: Navigation failed after recreation: {nav_e}")
+                            else:
+                                if self.debug:
+                                    logger.error(f"Browser {index}: Browser recreation failed, continuing with original browser")
+                    else:
+                        if self.debug:
+                            logger.debug(f"Browser {index}: Attempt {attempt + 1} error: {str(e)}")
                     continue
 
             elapsed_time = round(time.time() - start_time, 3)
@@ -843,16 +1029,35 @@ class TurnstileAPIServer:
             try:
                 # For Selenium, we don't need to close context, just return the browser
                 try:
-                    browser.current_url  # Check if browser is still alive
-                    await self.browser_pool.put((index, browser, browser_config))
-                    if self.debug:
-                        logger.debug(f"Browser {index}: Browser returned to pool")
+                    # Check if browser is still alive with timeout
+                    if await self._check_browser_health(browser, index):
+                        await self.browser_pool.put((index, browser, browser_config))
+                        if self.debug:
+                            logger.debug(f"Browser {index}: Browser returned to pool")
+                    else:
+                        if self.debug:
+                            logger.warning(f"Browser {index}: Browser health check failed, not returning to pool")
+                        # Try to close the disconnected browser safely
+                        try:
+                            browser.quit()
+                        except Exception:
+                            pass
                 except Exception:
                     if self.debug:
                         logger.warning(f"Browser {index}: Browser disconnected, not returning to pool")
+                    # Try to close the disconnected browser safely
+                    try:
+                        browser.quit()
+                    except Exception:
+                        pass
             except Exception as e:
                 if self.debug:
                     logger.warning(f"Browser {index}: Error returning browser to pool: {str(e)}")
+                # Try to close the browser safely
+                try:
+                    browser.quit()
+                except Exception:
+                    pass
 
 
 
