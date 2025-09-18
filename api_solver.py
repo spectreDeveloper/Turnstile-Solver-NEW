@@ -9,7 +9,16 @@ from typing import Optional, Union
 import argparse
 from quart import Quart, request, jsonify
 from camoufox.async_api import AsyncCamoufox
-from patchright.async_api import async_playwright
+import undetected_chromedriver as uc
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.chrome.options import Options
+from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException
+from selenium.webdriver.common.action_chains import ActionChains
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from db_results import init_db, save_result, load_result, cleanup_old_results
 from browser_configs import browser_config
 from rich.console import Console
@@ -132,6 +141,7 @@ class TurnstileAPIServer:
         self.proxy_support = proxy_support
         self.ipv6_support = ipv6_support
         self.browser_pool = asyncio.Queue()
+        self.executor = ThreadPoolExecutor(max_workers=self.thread_count)
         self.use_random_config = use_random_config
         self.browser_name = browser_name
         self.browser_version = browser_version
@@ -234,12 +244,9 @@ class TurnstileAPIServer:
 
     async def _initialize_browser(self) -> None:
         """Initialize the browser and create the page pool."""
-        playwright = None
         camoufox = None
 
-        if self.browser_type in ['chromium', 'chrome', 'msedge']:
-            playwright = await async_playwright().start()
-        elif self.browser_type == "camoufox":
+        if self.browser_type == "camoufox":
             camoufox = AsyncCamoufox(headless=self.headless)
 
         browser_configs = []
@@ -267,7 +274,7 @@ class TurnstileAPIServer:
                 useragent = self.useragent
                 sec_ch_ua = getattr(self, 'sec_ch_ua', '')
 
-            
+
             browser_configs.append({
                 'browser_name': browser,
                 'browser_version': version,
@@ -277,32 +284,55 @@ class TurnstileAPIServer:
 
         for i in range(self.thread_count):
             config = browser_configs[i]
-            
-            browser_args = [
-                "--window-position=0,0",
-                "--force-device-scale-factor=1"
-            ]
+
+            chrome_options = uc.ChromeOptions()
+            chrome_options.add_argument("--window-position=0,0")
+            chrome_options.add_argument("--force-device-scale-factor=1")
+            chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+            chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+            chrome_options.add_experimental_option('useAutomationExtension', False)
+
+            if self.headless:
+                chrome_options.add_argument("--headless=new")
+
             if config['useragent']:
-                browser_args.append(f"--user-agent={config['useragent']}")
-            
+                chrome_options.add_argument(f"--user-agent={config['useragent']}")
+
             # Add IPv6 arguments if IPv6 is enabled
             if self.ipv6_support and SUBNETS_IPV6:
-                browser_args.extend([
-                    
-                ])
+                chrome_options.add_argument("--enable-ipv6")
+                chrome_options.add_argument("--dns-prefetch-disable")
+                chrome_options.add_argument("--host-resolver-rules=MAP * 0.0.0.0,EXCLUDE localhost")
+                # Force IPv6 preference
+                chrome_options.add_argument("--force-ipv6")
                 if self.debug:
                     logger.debug(f"Browser {i+1}: Added IPv6 arguments to browser initialization")
             elif self.ipv6_support and not SUBNETS_IPV6:
                 if self.debug:
                     logger.warning(f"Browser {i+1}: IPv6 enabled but no valid subnets - browser will use regular IP")
-            
+
             browser = None
-            if self.browser_type in ['chromium', 'chrome', 'msedge'] and playwright:
-                browser = await playwright.chromium.launch(
-                    channel=self.browser_type,
-                    headless=self.headless,
-                    args=browser_args
-                )
+            if self.browser_type in ['chromium', 'chrome', 'msedge']:
+                try:
+                    # Create undetected chrome driver
+                    browser = uc.Chrome(options=chrome_options, version_main=None)
+
+                    # Execute script to remove webdriver property
+                    browser.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
+                    # Add chrome runtime
+                    browser.execute_script("""
+                        window.chrome = {
+                            runtime: {},
+                            loadTimes: function() {},
+                            csi: function() {},
+                        };
+                    """)
+
+                except Exception as e:
+                    logger.error(f"Failed to initialize Chrome driver: {e}")
+                    browser = None
+
             elif self.browser_type == "camoufox" and camoufox:
                 browser = await camoufox.start()
 
@@ -313,14 +343,14 @@ class TurnstileAPIServer:
                 logger.info(f"Browser {i + 1} initialized successfully with {config['browser_name']} {config['browser_version']}")
 
         logger.info(f"Browser pool initialized with {self.browser_pool.qsize()} browsers")
-        
+
         if self.use_random_config:
             logger.info(f"Each browser in pool received random configuration")
         elif self.browser_name and self.browser_version:
             logger.info(f"All browsers using configuration: {self.browser_name} {self.browser_version}")
         else:
             logger.info("Using custom configuration")
-            
+
         if self.debug:
             for i, config in enumerate(browser_configs):
                 logger.debug(f"Browser {i+1} config: {config['browser_name']} {config['browser_version']}")
@@ -338,113 +368,71 @@ class TurnstileAPIServer:
             except Exception as e:
                 logger.error(f"Error during periodic cleanup: {e}")
 
-    async def _antishadow_inject(self, page):
-        await page.add_init_script("""
-          (function() {
-            const originalAttachShadow = Element.prototype.attachShadow;
-            Element.prototype.attachShadow = function(init) {
-              const shadow = originalAttachShadow.call(this, init);
-              if (init.mode === 'closed') {
-                window.__lastClosedShadowRoot = shadow;
-              }
-              return shadow;
-            };
-          })();
-        """)
 
-
-
-    async def _optimized_route_handler(self, route):
-        """Оптимизированный обработчик маршрутов для экономии ресурсов."""
-        url = route.request.url
-        resource_type = route.request.resource_type
-
-        allowed_types = {'document', 'script', 'xhr', 'fetch'}
-
-        allowed_domains = [
-            'challenges.cloudflare.com',
-            'static.cloudflareinsights.com',
-            'cloudflare.com'
-        ]
-        
-        if resource_type in allowed_types:
-            await route.continue_()
-        elif any(domain in url for domain in allowed_domains):
-            await route.continue_() 
-        else:
-            await route.abort()
-
-    async def _block_rendering(self, page):
-        """Блокировка рендеринга для экономии ресурсов"""
-        await page.route("**/*", self._optimized_route_handler)
-
-    async def _unblock_rendering(self, page):
-        """Разблокировка рендеринга"""
-        await page.unroute("**/*", self._optimized_route_handler)
-
-    async def _test_browser_ip(self, page, index: int):
-        """Test the browser's public IP address using ipify.org"""
+    def _test_browser_ip_sync(self, driver, index: int):
+        """Test the browser's public IP address using ipify.org (sync version for selenium)"""
         try:
             if self.debug:
                 logger.debug(f"Browser {index}: Testing public IP address...")
-            
+
             # Navigate to ipify.org to get the public IP
-            await page.goto("https://api.ipify.org?format=json", wait_until="networkidle", timeout=10000)
-            
+            driver.get("https://api.ipify.org?format=json")
+
             # Extract the IP from the page content
-            content = await page.text_content("body")
-            
+            content = driver.find_element(By.TAG_NAME, "body").text
+
             # Try to parse JSON response
             try:
                 import json
                 ip_data = json.loads(content.strip())
                 ip_address = ip_data.get("ip", "unknown")
-                
+
                 # Determine if it's IPv4 or IPv6
                 if ":" in ip_address:
                     ip_type = "IPv6"
                     color = COLORS.get('GREEN')
                 else:
-                    ip_type = "IPv4" 
+                    ip_type = "IPv4"
                     color = COLORS.get('BLUE')
-                
+
                 logger.info(f"Browser {index}: Public IP - {color}{ip_address}{COLORS.get('RESET')} ({ip_type})")
-                
+
                 if self.ipv6_support and ip_type == "IPv4":
                     logger.info(f"Browser {index}: IPv6 mode: using IPv4 for network traffic (expected behavior)")
                     logger.info(f"Browser {index}: IPv6 addresses are generated for identification, network uses available protocols")
                 elif self.ipv6_support and ip_type == "IPv6":
                     logger.info(f"Browser {index}: IPv6 mode: successfully using IPv6 for network traffic")
-                    
+
             except json.JSONDecodeError as e:
                 logger.warning(f"Browser {index}: Could not parse IP response: {content} - {e}")
             except Exception as e:
                 logger.warning(f"Browser {index}: Error extracting IP: {e}")
-                
+
         except Exception as e:
             logger.warning(f"Browser {index}: Failed to test public IP: {e}")
 
-    async def _find_turnstile_elements(self, page, index: int):
-        """Умная проверка всех возможных Turnstile элементов"""
+    async def _test_browser_ip(self, driver, index: int):
+        """Async wrapper for IP testing"""
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(self.executor, self._test_browser_ip_sync, driver, index)
+
+    def _find_turnstile_elements_sync(self, driver, index: int):
+        """Selenium-based element finding"""
         selectors = [
-            '.cf-turnstile',
-            '[data-sitekey]',
-            'iframe[src*="turnstile"]',
-            'iframe[title*="widget"]',
-            'div[id*="turnstile"]',
-            'div[class*="turnstile"]'
+            (By.CSS_SELECTOR, '.cf-turnstile'),
+            (By.CSS_SELECTOR, '[data-sitekey]'),
+            (By.CSS_SELECTOR, 'iframe[src*="turnstile"]'),
+            (By.CSS_SELECTOR, 'iframe[title*="widget"]'),
+            (By.CSS_SELECTOR, 'div[id*="turnstile"]'),
+            (By.CSS_SELECTOR, 'div[class*="turnstile"]')
         ]
-        
+
         elements = []
-        for selector in selectors:
+        for by, selector in selectors:
             try:
-                # Безопасная проверка count()
-                try:
-                    count = await page.locator(selector).count()
-                except Exception:
-                    # Если count() дает ошибку, пропускаем этот селектор
-                    continue
-                    
+                found_elements = driver.find_elements(by, selector)
+                count = len(found_elements)
+
                 if count > 0:
                     elements.append((selector, count))
                     if self.debug:
@@ -453,31 +441,30 @@ class TurnstileAPIServer:
                 if self.debug:
                     logger.debug(f"Browser {index}: Selector '{selector}' failed: {str(e)}")
                 continue
-        
+
         return elements
 
-    async def _find_and_click_checkbox(self, page, index: int):
-        """Найти и кликнуть по чекбоксу Turnstile CAPTCHA внутри iframe"""
+    async def _find_turnstile_elements(self, driver, index: int):
+        """Async wrapper for element finding"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(self.executor, self._find_turnstile_elements_sync, driver, index)
+
+    def _find_and_click_checkbox_sync(self, driver, index: int):
+        """Selenium-based iframe and checkbox handling"""
         try:
-            # Пробуем разные селекторы iframe с защитой от ошибок
+            # Пробуем разные селекторы iframe
             iframe_selectors = [
                 'iframe[src*="challenges.cloudflare.com"]',
                 'iframe[src*="turnstile"]',
                 'iframe[title*="widget"]'
             ]
-            
-            iframe_locator = None
+
+            iframe_element = None
             for selector in iframe_selectors:
                 try:
-                    test_locator = page.locator(selector).first
-                    # Безопасная проверка count для iframe
-                    try:
-                        iframe_count = await test_locator.count()
-                    except Exception:
-                        iframe_count = 0
-                        
-                    if iframe_count > 0:
-                        iframe_locator = test_locator
+                    iframes = driver.find_elements(By.CSS_SELECTOR, selector)
+                    if iframes:
+                        iframe_element = iframes[0]
                         if self.debug:
                             logger.debug(f"Browser {index}: Found Turnstile iframe with selector: {selector}")
                         break
@@ -485,76 +472,119 @@ class TurnstileAPIServer:
                     if self.debug:
                         logger.debug(f"Browser {index}: Iframe selector '{selector}' failed: {str(e)}")
                     continue
-            
-            if iframe_locator:
+
+            if iframe_element:
                 try:
-                    # Получаем frame из iframe
-                    iframe_element = await iframe_locator.element_handle()
-                    frame = await iframe_element.content_frame()
-                    
-                    if frame:
-                        # Ищем чекбокс внутри iframe
-                        checkbox_selectors = [
-                            'input[type="checkbox"]',
-                            '.cb-lb input[type="checkbox"]',
-                            'label input[type="checkbox"]'
-                        ]
-                        
-                        for selector in checkbox_selectors:
-                            try:
-                                # Полностью избегаем locator.count() в iframe - используем альтернативный подход
-                                try:
-                                    # Пробуем кликнуть напрямую без count проверки
-                                    checkbox = frame.locator(selector).first
-                                    await checkbox.click(timeout=2000)
-                                    if self.debug:
-                                        logger.debug(f"Browser {index}: Successfully clicked checkbox in iframe with selector '{selector}'")
-                                    return True
-                                except Exception as click_e:
-                                    # Если прямой клик не сработал, записываем в debug но не падаем
-                                    if self.debug:
-                                        logger.debug(f"Browser {index}: Direct checkbox click failed for '{selector}': {str(click_e)}")
-                                    continue
-                            except Exception as e:
-                                if self.debug:
-                                    logger.debug(f"Browser {index}: Iframe checkbox selector '{selector}' failed: {str(e)}")
-                                continue
-                    
-                        # Если нашли iframe, но не смогли кликнуть чекбокс, пробуем клик по iframe
+                    # Switch to iframe
+                    driver.switch_to.frame(iframe_element)
+
+                    # Ищем чекбокс внутри iframe
+                    checkbox_selectors = [
+                        'input[type="checkbox"]',
+                        '.cb-lb input[type="checkbox"]',
+                        'label input[type="checkbox"]'
+                    ]
+
+                    for selector in checkbox_selectors:
                         try:
-                            if self.debug:
-                                logger.debug(f"Browser {index}: Trying to click iframe directly as fallback")
-                            await iframe_locator.click(timeout=1000)
-                            return True
+                            checkboxes = driver.find_elements(By.CSS_SELECTOR, selector)
+                            if checkboxes:
+                                checkbox = checkboxes[0]
+                                ActionChains(driver).click(checkbox).perform()
+                                if self.debug:
+                                    logger.debug(f"Browser {index}: Successfully clicked checkbox in iframe with selector '{selector}'")
+                                driver.switch_to.default_content()
+                                return True
                         except Exception as e:
                             if self.debug:
-                                logger.debug(f"Browser {index}: Iframe direct click failed: {str(e)}")
-                
+                                logger.debug(f"Browser {index}: Iframe checkbox selector '{selector}' failed: {str(e)}")
+                            continue
+
+                    # Switch back to default content
+                    driver.switch_to.default_content()
+
+                    # Если не смогли кликнуть чекбокс, пробуем клик по iframe
+                    try:
+                        if self.debug:
+                            logger.debug(f"Browser {index}: Trying to click iframe directly as fallback")
+                        ActionChains(driver).click(iframe_element).perform()
+                        return True
+                    except Exception as e:
+                        if self.debug:
+                            logger.debug(f"Browser {index}: Iframe direct click failed: {str(e)}")
+
                 except Exception as e:
                     if self.debug:
                         logger.debug(f"Browser {index}: Failed to access iframe content: {str(e)}")
-            
+                    try:
+                        driver.switch_to.default_content()
+                    except:
+                        pass
+
         except Exception as e:
             if self.debug:
                 logger.debug(f"Browser {index}: General iframe search failed: {str(e)}")
-        
+
         return False
 
-    async def _try_click_strategies(self, page, index: int):
+    async def _find_and_click_checkbox(self, driver, index: int):
+        """Async wrapper for checkbox clicking"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(self.executor, self._find_and_click_checkbox_sync, driver, index)
+
+    def _safe_click_sync(self, driver, selector: str, index: int):
+        """Selenium-based safe click"""
+        try:
+            if selector.startswith("//"):
+                # XPath selector
+                elements = driver.find_elements(By.XPATH, selector)
+            else:
+                # CSS selector
+                elements = driver.find_elements(By.CSS_SELECTOR, selector)
+
+            if elements:
+                ActionChains(driver).click(elements[0]).perform()
+                return True
+        except Exception as e:
+            if self.debug and "Can't query n-th element" not in str(e):
+                logger.debug(f"Browser {index}: Safe click failed for '{selector}': {str(e)}")
+        return False
+
+    def _js_click_sync(self, driver, index: int):
+        """JavaScript click execution"""
+        try:
+            driver.execute_script("document.querySelector('.cf-turnstile')?.click()")
+            return True
+        except Exception as e:
+            if self.debug:
+                logger.debug(f"Browser {index}: JS click failed: {str(e)}")
+            return False
+
+    async def _safe_click(self, driver, selector: str, index: int):
+        """Async wrapper for safe click"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(self.executor, self._safe_click_sync, driver, selector, index)
+
+    async def _js_click(self, driver, index: int):
+        """Async wrapper for JS click"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(self.executor, self._js_click_sync, driver, index)
+
+    async def _try_click_strategies(self, driver, index: int):
         strategies = [
-            ('checkbox_click', lambda: self._find_and_click_checkbox(page, index)),
-            ('direct_widget', lambda: self._safe_click(page, '.cf-turnstile', index)),
-            ('iframe_click', lambda: self._safe_click(page, 'iframe[src*="turnstile"]', index)),
-            ('js_click', lambda: page.evaluate("document.querySelector('.cf-turnstile')?.click()")),
-            ('sitekey_attr', lambda: self._safe_click(page, '[data-sitekey]', index)),
-            ('any_turnstile', lambda: self._safe_click(page, '*[class*="turnstile"]', index)),
-            ('xpath_click', lambda: self._safe_click(page, "//div[@class='cf-turnstile']", index))
+            ('checkbox_click', lambda: self._find_and_click_checkbox(driver, index)),
+            ('direct_widget', lambda: self._safe_click(driver, '.cf-turnstile', index)),
+            ('iframe_click', lambda: self._safe_click(driver, 'iframe[src*="turnstile"]', index)),
+            ('js_click', lambda: self._js_click(driver, index)),
+            ('sitekey_attr', lambda: self._safe_click(driver, '[data-sitekey]', index)),
+            ('any_turnstile', lambda: self._safe_click(driver, '*[class*="turnstile"]', index)),
+            ('xpath_click', lambda: self._safe_click(driver, "//div[@class='cf-turnstile']", index))
         ]
-        
+
         for strategy_name, strategy_func in strategies:
             try:
                 result = await strategy_func()
-                if result is True or result is None:  # None означает успех для большинства стратегий
+                if result is True or result is None:
                     if self.debug:
                         logger.debug(f"Browser {index}: Click strategy '{strategy_name}' succeeded")
                     return True
@@ -562,23 +592,10 @@ class TurnstileAPIServer:
                 if self.debug:
                     logger.debug(f"Browser {index}: Click strategy '{strategy_name}' failed: {str(e)}")
                 continue
-        
+
         return False
 
-    async def _safe_click(self, page, selector: str, index: int):
-        """Полностью безопасный клик с максимальной защитой от ошибок"""
-        try:
-            # Пробуем кликнуть напрямую без count() проверки
-            locator = page.locator(selector).first
-            await locator.click(timeout=1000)
-            return True
-        except Exception as e:
-            # Логируем ошибку только в debug режиме
-            if self.debug and "Can't query n-th element" not in str(e):
-                logger.debug(f"Browser {index}: Safe click failed for '{selector}': {str(e)}")
-            return False
-
-    async def _load_captcha_overlay(self, page, websiteKey: str, action: str = '', index: int = 0):
+    def _load_captcha_overlay_sync(self, driver, websiteKey: str, action: str = '', index: int = 0):
         script = f"""
         const existing = document.querySelector('#captcha-overlay');
         if (existing) existing.remove();
@@ -612,20 +629,28 @@ class TurnstileAPIServer:
         document.head.appendChild(script);
         """
 
-        await page.evaluate(script)
+        driver.execute_script(script)
         if self.debug:
             logger.debug(f"Browser {index}: Created CAPTCHA overlay with sitekey: {websiteKey}")
+
+    async def _load_captcha_overlay(self, driver, websiteKey: str, action: str = '', index: int = 0):
+        """Async wrapper for overlay creation"""
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(self.executor, self._load_captcha_overlay_sync, driver, websiteKey, action, index)
 
     async def _solve_turnstile(self, task_id: str, url: str, sitekey: str, action: Optional[str] = None, cdata: Optional[str] = None):
         """Solve the Turnstile challenge."""
         proxy = None
 
         index, browser, browser_config = await self.browser_pool.get()
-        
+
         try:
-            if hasattr(browser, 'is_connected') and not browser.is_connected():
+            # For undetected chromedriver, check if browser session is still valid
+            try:
+                browser.current_url  # This will throw if browser is closed
+            except Exception:
                 if self.debug:
-                    logger.warning(f"Browser {index}: Browser disconnected, skipping")
+                    logger.warning(f"Browser {index}: Browser session invalid, skipping")
                 await self.browser_pool.put((index, browser, browser_config))
                 await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": 0})
                 return
@@ -633,110 +658,9 @@ class TurnstileAPIServer:
             if self.debug:
                 logger.warning(f"Browser {index}: Cannot check browser state: {str(e)}")
 
-        if self.proxy_support:
-            proxy_file_path = os.path.join(os.getcwd(), "proxies.txt")
-
-            try:
-                with open(proxy_file_path) as proxy_file:
-                    proxies = [line.strip() for line in proxy_file if line.strip()]
-
-                proxy = random.choice(proxies) if proxies else None
-                
-                if self.debug and proxy:
-                    logger.debug(f"Browser {index}: Selected proxy: {proxy}")
-                elif self.debug and not proxy:
-                    logger.debug(f"Browser {index}: No proxies available")
-                    
-            except FileNotFoundError:
-                logger.warning(f"Proxy file not found: {proxy_file_path}")
-                proxy = None
-            except Exception as e:
-                logger.error(f"Error reading proxy file: {str(e)}")
-                proxy = None
-
-            if proxy:
-                if '@' in proxy:
-                    try:
-                        scheme_part, auth_part = proxy.split('://')
-                        auth, address = auth_part.split('@')
-                        username, password = auth.split(':')
-                        ip, port = address.split(':')
-                        if self.debug:
-                            logger.debug(f"Browser {index}: Creating context with proxy {scheme_part}://{ip}:{port} (auth: {username}:***)")
-                        context_options = {
-                            "proxy": {
-                                "server": f"{scheme_part}://{ip}:{port}",
-                                "username": username,
-                                "password": password
-                            },
-                            "user_agent": browser_config['useragent']
-                        }
-                        
-                        if browser_config['sec_ch_ua'] and browser_config['sec_ch_ua'].strip():
-                            context_options['extra_http_headers'] = {
-                                'sec-ch-ua': browser_config['sec_ch_ua']
-                            }
-                        
-                        context = await browser.new_context(**context_options)
-                    except ValueError:
-                        raise ValueError(f"Invalid proxy format: {proxy}")
-                else:
-                    parts = proxy.split(':')
-                    if len(parts) == 5:
-                        proxy_scheme, proxy_ip, proxy_port, proxy_user, proxy_pass = parts
-                        if self.debug:
-                            logger.debug(f"Browser {index}: Creating context with proxy {proxy_scheme}://{proxy_ip}:{proxy_port} (auth: {proxy_user}:***)")
-                        context_options = {
-                            "proxy": {
-                                "server": f"{proxy_scheme}://{proxy_ip}:{proxy_port}",
-                                "username": proxy_user,
-                                "password": proxy_pass
-                            },
-                            "user_agent": browser_config['useragent']
-                        }
-                        
-                        if browser_config['sec_ch_ua'] and browser_config['sec_ch_ua'].strip():
-                            context_options['extra_http_headers'] = {
-                                'sec-ch-ua': browser_config['sec_ch_ua']
-                            }
-                        
-                        context = await browser.new_context(**context_options)
-                    elif len(parts) == 3:
-                        if self.debug:
-                            logger.debug(f"Browser {index}: Creating context with proxy {proxy}")
-                        context_options = {
-                            "proxy": {"server": f"{proxy}"},
-                            "user_agent": browser_config['useragent']
-                        }
-                        
-                        if browser_config['sec_ch_ua'] and browser_config['sec_ch_ua'].strip():
-                            context_options['extra_http_headers'] = {
-                                'sec-ch-ua': browser_config['sec_ch_ua']
-                            }
-                        
-                        context = await browser.new_context(**context_options)
-                    else:
-                        raise ValueError(f"Invalid proxy format: {proxy}")
-            else:
-                if self.debug:
-                    logger.debug(f"Browser {index}: Creating context without proxy")
-                context_options = {"user_agent": browser_config['useragent']}
-                
-                if browser_config['sec_ch_ua'] and browser_config['sec_ch_ua'].strip():
-                    context_options['extra_http_headers'] = {
-                        'sec-ch-ua': browser_config['sec_ch_ua']
-                    }
-                
-                context = await browser.new_context(**context_options)
-        else:
-            context_options = {"user_agent": browser_config['useragent']}
-            
-            if browser_config['sec_ch_ua'] and browser_config['sec_ch_ua'].strip():
-                context_options['extra_http_headers'] = {
-                    'sec-ch-ua': browser_config['sec_ch_ua']
-                }
-            
-            context = await browser.new_context(**context_options)
+        # For Selenium, we need to handle proxy by creating a new driver instance
+        # Since proxy configuration requires restarting the browser, we skip proxy for now
+        # and focus on IPv6 configuration which was already handled during browser init
 
         # Configure IPv6 if enabled
         ipv6_address = None
@@ -746,31 +670,6 @@ class TurnstileAPIServer:
                 logger.debug(f"Browser {index}: Generated IPv6 address: {ipv6_address}")
                 logger.debug(f"Browser {index}: Available IPv6 subnets: {', '.join(SUBNETS_IPV6)}")
                 logger.debug(f"Browser {index}: IPv6 support active - browser configured to prefer IPv6 connections")
-            try:
-                # For browsers that support it, add IPv6-related arguments
-                if hasattr(browser, 'browser_type') or 'chromium' in str(type(browser)).lower():
-                    # Add IPv6 preference arguments
-                    browser_args = [
-                        '--enable-ipv6',
-                        '--force-ipv6',
-                        '--dns-prefetch-disable',
-                        '--host-resolver-rules=MAP * 0.0.0.0,EXCLUDE localhost'
-                    ]
-                    
-                    # Try to add arguments to existing browser if possible
-                    if hasattr(browser, '_process') and hasattr(browser._process, 'args'):
-                        # Extend existing args if browser supports it
-                        if self.debug:
-                            logger.debug(f"Browser {index}: Added IPv6 arguments to browser")
-                    else:
-                        if self.debug:
-                            logger.debug(f"Browser {index}: IPv6 arguments prepared for next browser instance")
-                
-                if self.debug:
-                    logger.debug(f"Browser {index}: IPv6 support configured - browser will prefer IPv6 connections")
-            except Exception as e:
-                if self.debug:
-                    logger.debug(f"Browser {index}: Could not configure IPv6 arguments: {e}")
         elif self.ipv6_support and not SUBNETS_IPV6:
             if self.debug:
                 logger.warning(f"Browser {index}: IPv6 enabled but no valid subnets configured - falling back to regular IP")
@@ -778,70 +677,57 @@ class TurnstileAPIServer:
             if self.debug:
                 logger.debug(f"Browser {index}: IPv6 not enabled - using default IP resolution")
 
-        page = await context.new_page()
-        
         # Test IP address if IPv6 is enabled or debug is active
         if self.ipv6_support or self.debug:
-            await self._test_browser_ip(page, index)
-        
-        await self._antishadow_inject(page)
-        
-        await self._block_rendering(page)
-        
-        await page.add_init_script("""
-        Object.defineProperty(navigator, 'webdriver', {
-            get: () => undefined,
-        });
-        
-        window.chrome = {
-            runtime: {},
-            loadTimes: function() {},
-            csi: function() {},
-        };
-        """)
-        
+            await self._test_browser_ip(browser, index)
+
+        # Set window size for Chrome-based browsers
         if self.browser_type in ['chromium', 'chrome', 'msedge']:
-            await page.set_viewport_size({"width": 500, "height": 100})
-            if self.debug:
-                logger.debug(f"Browser {index}: Set viewport size to 500x240")
+            try:
+                browser.set_window_size(500, 100)
+                if self.debug:
+                    logger.debug(f"Browser {index}: Set window size to 500x100")
+            except Exception as e:
+                if self.debug:
+                    logger.debug(f"Browser {index}: Could not set window size: {e}")
 
         start_time = time.time()
 
         try:
             if self.debug:
-                logger.debug(f"Browser {index}: Starting Turnstile solve for URL: {url} with Sitekey: {sitekey} | Action: {action} | Cdata: {cdata} | Proxy: {proxy}")
-                logger.debug(f"Browser {index}: Setting up optimized page loading with resource blocking")
+                logger.debug(f"Browser {index}: Starting Turnstile solve for URL: {url} with Sitekey: {sitekey} | Action: {action} | Cdata: {cdata}")
 
             if self.debug:
                 logger.debug(f"Browser {index}: Loading real website directly: {url}")
 
-            await page.goto(url, wait_until='domcontentloaded', timeout=30000)
+            # Navigate to the target URL using Selenium
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(self.executor, browser.get, url)
 
-            await self._unblock_rendering(page)
-
-            # Ждем немного времени для загрузки CAPTCHA
+            # Wait for page to load
             await asyncio.sleep(3)
 
-            locator = page.locator('input[name="cf-turnstile-response"]')
-            max_attempts = 20 
-            
+            max_attempts = 20
+
             for attempt in range(max_attempts):
                 try:
-                    # Безопасная проверка количества элементов с токеном
-                    try:
-                        count = await locator.count()
-                    except Exception as e:
-                        if self.debug:
-                            logger.debug(f"Browser {index}: Locator count failed on attempt {attempt + 1}: {str(e)}")
-                        count = 0
-                    
+                    # Find token elements using Selenium
+                    def find_token_elements():
+                        return browser.find_elements(By.CSS_SELECTOR, 'input[name="cf-turnstile-response"]')
+
+                    token_elements = await loop.run_in_executor(self.executor, find_token_elements)
+                    count = len(token_elements)
+
                     if count == 0:
                         if self.debug:
                             logger.debug(f"Browser {index}: No token elements found on attempt {attempt + 1}")
                     elif count == 1:
-                        # Если только один элемент, проверяем его токен
+                        # Check single element token
                         try:
-                            token = await locator.input_value(timeout=500)
+                            def get_token_value():
+                                return token_elements[0].get_attribute('value')
+
+                            token = await loop.run_in_executor(self.executor, get_token_value)
                             if token:
                                 elapsed_time = round(time.time() - start_time, 3)
                                 success_msg = f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds"
@@ -852,13 +738,16 @@ class TurnstileAPIServer:
                             if self.debug:
                                 logger.debug(f"Browser {index}: Single token element check failed: {str(e)}")
                     else:
-                        # Если несколько элементов, проверяем все по очереди
+                        # Check multiple elements
                         if self.debug:
                             logger.debug(f"Browser {index}: Found {count} token elements, checking all")
-                        
+
                         for i in range(count):
                             try:
-                                element_token = await locator.nth(i).input_value(timeout=500)
+                                def get_element_token(idx):
+                                    return token_elements[idx].get_attribute('value')
+
+                                element_token = await loop.run_in_executor(self.executor, get_element_token, i)
                                 if element_token:
                                     elapsed_time = round(time.time() - start_time, 3)
                                     success_msg = f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{element_token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds"
@@ -869,43 +758,38 @@ class TurnstileAPIServer:
                                 if self.debug:
                                     logger.debug(f"Browser {index}: Token element {i} check failed: {str(e)}")
                                 continue
-                    
-                    # Клик стратегии только каждые 3 попытки и не сразу
+
+                    # Click strategies every 3 attempts
                     if attempt > 2 and attempt % 3 == 0:
-                        click_success = await self._try_click_strategies(page, index)
+                        click_success = await self._try_click_strategies(browser, index)
                         if not click_success and self.debug:
                             logger.debug(f"Browser {index}: All click strategies failed on attempt {attempt + 1}")
-                    
-                    # Fallback overlay на 10 попытке если токена все еще нет
+
+                    # Fallback overlay on attempt 10
                     if attempt == 10:
                         try:
-                            # Безопасная проверка count для overlay
-                            try:
-                                current_count = await locator.count()
-                            except Exception:
-                                current_count = 0
-                                
+                            current_count = len(await loop.run_in_executor(self.executor, find_token_elements))
                             if current_count == 0:
                                 if self.debug:
                                     logger.debug(f"Browser {index}: Creating overlay as fallback strategy")
-                                await self._load_captcha_overlay(page, sitekey, action or '', index)
+                                await self._load_captcha_overlay(browser, sitekey, action or '', index)
                                 await asyncio.sleep(2)
                         except Exception as e:
                             if self.debug:
                                 logger.debug(f"Browser {index}: Fallback overlay creation failed: {str(e)}")
-                    
-                    # Адаптивное ожидание
+
+                    # Adaptive waiting
                     wait_time = min(0.5 + (attempt * 0.05), 2.0)
                     await asyncio.sleep(wait_time)
-                    
+
                     if self.debug and attempt % 5 == 0:
                         logger.debug(f"Browser {index}: Attempt {attempt + 1}/{max_attempts} - No valid token yet")
-                        
+
                 except Exception as e:
                     if self.debug:
                         logger.debug(f"Browser {index}: Attempt {attempt + 1} error: {str(e)}")
                     continue
-            
+
             elapsed_time = round(time.time() - start_time, 3)
             await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time})
             if self.debug:
@@ -917,22 +801,16 @@ class TurnstileAPIServer:
                 logger.error(f"Browser {index}: Error solving Turnstile: {str(e)}")
         finally:
             if self.debug:
-                logger.debug(f"Browser {index}: Closing browser context and cleaning up")
-            
+                logger.debug(f"Browser {index}: Cleaning up and returning browser to pool")
+
             try:
-                await context.close()
-                if self.debug:
-                    logger.debug(f"Browser {index}: Context closed successfully")
-            except Exception as e:
-                if self.debug:
-                    logger.warning(f"Browser {index}: Error closing context: {str(e)}")
-            
-            try:
-                if hasattr(browser, 'is_connected') and browser.is_connected():
+                # For Selenium, we don't need to close context, just return the browser
+                try:
+                    browser.current_url  # Check if browser is still alive
                     await self.browser_pool.put((index, browser, browser_config))
                     if self.debug:
                         logger.debug(f"Browser {index}: Browser returned to pool")
-                else:
+                except Exception:
                     if self.debug:
                         logger.warning(f"Browser {index}: Browser disconnected, not returning to pool")
             except Exception as e:

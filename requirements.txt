@@ -1,7 +1,8 @@
 quart
 asyncio
 argparse
-patchright
+undetected-chromedriver
+selenium
 camoufox[geoip]
 requests
 aiosqlite
