@@ -5,16 +5,13 @@ import uuid
 import random
 import logging
 import asyncio
-from typing import Optional, Union
+from typing import Optional
 import argparse
 from quart import Quart, request, jsonify
 from camoufox.async_api import AsyncCamoufox
 import undetected_chromedriver as uc
-from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.action_chains import ActionChains
-import threading
-from concurrent.futures import ThreadPoolExecutor
 from db_results import init_db, save_result, load_result, cleanup_old_results
 from browser_configs import browser_config
 from rich.console import Console
@@ -629,8 +626,6 @@ class TurnstileAPIServer:
 
     async def _solve_turnstile(self, task_id: str, url: str, sitekey: str, action: Optional[str] = None, cdata: Optional[str] = None):
         """Solve the Turnstile challenge."""
-        proxy = None
-
         index, browser, browser_config = await self.browser_pool.get()
 
         try:
@@ -672,13 +667,16 @@ class TurnstileAPIServer:
 
         # Set window size for Chrome-based browsers
         if self.browser_type in ['chromium', 'chrome', 'msedge']:
-            try:
-                browser.set_window_size(500, 100)
-                if self.debug:
-                    logger.debug(f"Browser {index}: Set window size to 500x100")
-            except Exception as e:
-                if self.debug:
-                    logger.debug(f"Browser {index}: Could not set window size: {e}")
+            def set_window_size():
+                try:
+                    browser.set_window_size(500, 100)
+                    if self.debug:
+                        logger.debug(f"Browser {index}: Set window size to 500x100")
+                except Exception as e:
+                    if self.debug:
+                        logger.debug(f"Browser {index}: Could not set window size: {e}")
+
+            await asyncio.get_event_loop().run_in_executor(None, set_window_size)
 
         start_time = time.time()
 
@@ -690,8 +688,10 @@ class TurnstileAPIServer:
                 logger.debug(f"Browser {index}: Loading real website directly: {url}")
 
             # Navigate to the target URL using Selenium
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(self.executor, browser.get, url)
+            def navigate_to_url():
+                browser.get(url)
+
+            await asyncio.get_event_loop().run_in_executor(None, navigate_to_url)
 
             # Wait for page to load
             await asyncio.sleep(3)
@@ -704,7 +704,7 @@ class TurnstileAPIServer:
                     def find_token_elements():
                         return browser.find_elements(By.CSS_SELECTOR, 'input[name="cf-turnstile-response"]')
 
-                    token_elements = await loop.run_in_executor(self.executor, find_token_elements)
+                    token_elements = await asyncio.get_event_loop().run_in_executor(None, find_token_elements)
                     count = len(token_elements)
 
                     if count == 0:
@@ -716,7 +716,7 @@ class TurnstileAPIServer:
                             def get_token_value():
                                 return token_elements[0].get_attribute('value')
 
-                            token = await loop.run_in_executor(self.executor, get_token_value)
+                            token = await asyncio.get_event_loop().run_in_executor(None, get_token_value)
                             if token:
                                 elapsed_time = round(time.time() - start_time, 3)
                                 success_msg = f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds"
@@ -736,7 +736,7 @@ class TurnstileAPIServer:
                                 def get_element_token(idx):
                                     return token_elements[idx].get_attribute('value')
 
-                                element_token = await loop.run_in_executor(self.executor, get_element_token, i)
+                                element_token = await asyncio.get_event_loop().run_in_executor(None, get_element_token, i)
                                 if element_token:
                                     elapsed_time = round(time.time() - start_time, 3)
                                     success_msg = f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{element_token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds"
@@ -757,7 +757,7 @@ class TurnstileAPIServer:
                     # Fallback overlay on attempt 10
                     if attempt == 10:
                         try:
-                            current_count = len(await loop.run_in_executor(self.executor, find_token_elements))
+                            current_count = len(await asyncio.get_event_loop().run_in_executor(None, find_token_elements))
                             if current_count == 0:
                                 if self.debug:
                                     logger.debug(f"Browser {index}: Creating overlay as fallback strategy")
