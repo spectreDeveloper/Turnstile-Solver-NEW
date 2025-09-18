@@ -12,10 +12,6 @@ from camoufox.async_api import AsyncCamoufox
 import undetected_chromedriver as uc
 from selenium import webdriver
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.chrome.options import Options
-from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException
 from selenium.webdriver.common.action_chains import ActionChains
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -141,7 +137,6 @@ class TurnstileAPIServer:
         self.proxy_support = proxy_support
         self.ipv6_support = ipv6_support
         self.browser_pool = asyncio.Queue()
-        self.executor = ThreadPoolExecutor(max_workers=self.thread_count)
         self.use_random_config = use_random_config
         self.browser_name = browser_name
         self.browser_version = browser_version
@@ -314,8 +309,13 @@ class TurnstileAPIServer:
             browser = None
             if self.browser_type in ['chromium', 'chrome', 'msedge']:
                 try:
-                    # Create undetected chrome driver
-                    browser = uc.Chrome(options=chrome_options, version_main=None)
+                    # Create undetected chrome driver with proper configuration
+                    browser = uc.Chrome(
+                        options=chrome_options,
+                        version_main=None,
+                        driver_executable_path=None,
+                        browser_executable_path=None
+                    )
 
                     # Execute script to remove webdriver property
                     browser.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
@@ -369,206 +369,196 @@ class TurnstileAPIServer:
                 logger.error(f"Error during periodic cleanup: {e}")
 
 
-    def _test_browser_ip_sync(self, driver, index: int):
-        """Test the browser's public IP address using ipify.org (sync version for selenium)"""
+    async def _test_browser_ip(self, driver, index: int):
+        """Test the browser's public IP address using ipify.org"""
         try:
             if self.debug:
                 logger.debug(f"Browser {index}: Testing public IP address...")
 
-            # Navigate to ipify.org to get the public IP
-            driver.get("https://api.ipify.org?format=json")
+            # Run in thread to avoid blocking
+            def test_ip():
+                try:
+                    # Navigate to ipify.org to get the public IP
+                    driver.get("https://api.ipify.org?format=json")
 
-            # Extract the IP from the page content
-            content = driver.find_element(By.TAG_NAME, "body").text
+                    # Extract the IP from the page content
+                    content = driver.find_element(By.TAG_NAME, "body").text
 
-            # Try to parse JSON response
-            try:
-                import json
-                ip_data = json.loads(content.strip())
-                ip_address = ip_data.get("ip", "unknown")
+                    # Try to parse JSON response
+                    import json
+                    ip_data = json.loads(content.strip())
+                    ip_address = ip_data.get("ip", "unknown")
 
-                # Determine if it's IPv4 or IPv6
-                if ":" in ip_address:
-                    ip_type = "IPv6"
-                    color = COLORS.get('GREEN')
-                else:
-                    ip_type = "IPv4"
-                    color = COLORS.get('BLUE')
+                    # Determine if it's IPv4 or IPv6
+                    if ":" in ip_address:
+                        ip_type = "IPv6"
+                        color = COLORS.get('GREEN')
+                    else:
+                        ip_type = "IPv4"
+                        color = COLORS.get('BLUE')
 
-                logger.info(f"Browser {index}: Public IP - {color}{ip_address}{COLORS.get('RESET')} ({ip_type})")
+                    logger.info(f"Browser {index}: Public IP - {color}{ip_address}{COLORS.get('RESET')} ({ip_type})")
 
-                if self.ipv6_support and ip_type == "IPv4":
-                    logger.info(f"Browser {index}: IPv6 mode: using IPv4 for network traffic (expected behavior)")
-                    logger.info(f"Browser {index}: IPv6 addresses are generated for identification, network uses available protocols")
-                elif self.ipv6_support and ip_type == "IPv6":
-                    logger.info(f"Browser {index}: IPv6 mode: successfully using IPv6 for network traffic")
+                    if self.ipv6_support and ip_type == "IPv4":
+                        logger.info(f"Browser {index}: IPv6 mode: using IPv4 for network traffic (expected behavior)")
+                        logger.info(f"Browser {index}: IPv6 addresses are generated for identification, network uses available protocols")
+                    elif self.ipv6_support and ip_type == "IPv6":
+                        logger.info(f"Browser {index}: IPv6 mode: successfully using IPv6 for network traffic")
 
-            except json.JSONDecodeError as e:
-                logger.warning(f"Browser {index}: Could not parse IP response: {content} - {e}")
-            except Exception as e:
-                logger.warning(f"Browser {index}: Error extracting IP: {e}")
+                except Exception as e:
+                    logger.warning(f"Browser {index}: Failed to test IP: {e}")
+
+            # Run in background thread
+            await asyncio.get_event_loop().run_in_executor(None, test_ip)
 
         except Exception as e:
             logger.warning(f"Browser {index}: Failed to test public IP: {e}")
 
-    async def _test_browser_ip(self, driver, index: int):
-        """Async wrapper for IP testing"""
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(self.executor, self._test_browser_ip_sync, driver, index)
-
-    def _find_turnstile_elements_sync(self, driver, index: int):
-        """Selenium-based element finding"""
-        selectors = [
-            (By.CSS_SELECTOR, '.cf-turnstile'),
-            (By.CSS_SELECTOR, '[data-sitekey]'),
-            (By.CSS_SELECTOR, 'iframe[src*="turnstile"]'),
-            (By.CSS_SELECTOR, 'iframe[title*="widget"]'),
-            (By.CSS_SELECTOR, 'div[id*="turnstile"]'),
-            (By.CSS_SELECTOR, 'div[class*="turnstile"]')
-        ]
-
-        elements = []
-        for by, selector in selectors:
-            try:
-                found_elements = driver.find_elements(by, selector)
-                count = len(found_elements)
-
-                if count > 0:
-                    elements.append((selector, count))
-                    if self.debug:
-                        logger.debug(f"Browser {index}: Found {count} elements with selector '{selector}'")
-            except Exception as e:
-                if self.debug:
-                    logger.debug(f"Browser {index}: Selector '{selector}' failed: {str(e)}")
-                continue
-
-        return elements
-
     async def _find_turnstile_elements(self, driver, index: int):
-        """Async wrapper for element finding"""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(self.executor, self._find_turnstile_elements_sync, driver, index)
-
-    def _find_and_click_checkbox_sync(self, driver, index: int):
-        """Selenium-based iframe and checkbox handling"""
-        try:
-            # Пробуем разные селекторы iframe
-            iframe_selectors = [
-                'iframe[src*="challenges.cloudflare.com"]',
-                'iframe[src*="turnstile"]',
-                'iframe[title*="widget"]'
+        """Selenium-based element finding"""
+        def find_elements():
+            selectors = [
+                (By.CSS_SELECTOR, '.cf-turnstile'),
+                (By.CSS_SELECTOR, '[data-sitekey]'),
+                (By.CSS_SELECTOR, 'iframe[src*="turnstile"]'),
+                (By.CSS_SELECTOR, 'iframe[title*="widget"]'),
+                (By.CSS_SELECTOR, 'div[id*="turnstile"]'),
+                (By.CSS_SELECTOR, 'div[class*="turnstile"]')
             ]
 
-            iframe_element = None
-            for selector in iframe_selectors:
+            elements = []
+            for by, selector in selectors:
                 try:
-                    iframes = driver.find_elements(By.CSS_SELECTOR, selector)
-                    if iframes:
-                        iframe_element = iframes[0]
+                    found_elements = driver.find_elements(by, selector)
+                    count = len(found_elements)
+
+                    if count > 0:
+                        elements.append((selector, count))
                         if self.debug:
-                            logger.debug(f"Browser {index}: Found Turnstile iframe with selector: {selector}")
-                        break
+                            logger.debug(f"Browser {index}: Found {count} elements with selector '{selector}'")
                 except Exception as e:
                     if self.debug:
-                        logger.debug(f"Browser {index}: Iframe selector '{selector}' failed: {str(e)}")
+                        logger.debug(f"Browser {index}: Selector '{selector}' failed: {str(e)}")
                     continue
 
-            if iframe_element:
-                try:
-                    # Switch to iframe
-                    driver.switch_to.frame(iframe_element)
+            return elements
 
-                    # Ищем чекбокс внутри iframe
-                    checkbox_selectors = [
-                        'input[type="checkbox"]',
-                        '.cb-lb input[type="checkbox"]',
-                        'label input[type="checkbox"]'
-                    ]
-
-                    for selector in checkbox_selectors:
-                        try:
-                            checkboxes = driver.find_elements(By.CSS_SELECTOR, selector)
-                            if checkboxes:
-                                checkbox = checkboxes[0]
-                                ActionChains(driver).click(checkbox).perform()
-                                if self.debug:
-                                    logger.debug(f"Browser {index}: Successfully clicked checkbox in iframe with selector '{selector}'")
-                                driver.switch_to.default_content()
-                                return True
-                        except Exception as e:
-                            if self.debug:
-                                logger.debug(f"Browser {index}: Iframe checkbox selector '{selector}' failed: {str(e)}")
-                            continue
-
-                    # Switch back to default content
-                    driver.switch_to.default_content()
-
-                    # Если не смогли кликнуть чекбокс, пробуем клик по iframe
-                    try:
-                        if self.debug:
-                            logger.debug(f"Browser {index}: Trying to click iframe directly as fallback")
-                        ActionChains(driver).click(iframe_element).perform()
-                        return True
-                    except Exception as e:
-                        if self.debug:
-                            logger.debug(f"Browser {index}: Iframe direct click failed: {str(e)}")
-
-                except Exception as e:
-                    if self.debug:
-                        logger.debug(f"Browser {index}: Failed to access iframe content: {str(e)}")
-                    try:
-                        driver.switch_to.default_content()
-                    except:
-                        pass
-
-        except Exception as e:
-            if self.debug:
-                logger.debug(f"Browser {index}: General iframe search failed: {str(e)}")
-
-        return False
+        return await asyncio.get_event_loop().run_in_executor(None, find_elements)
 
     async def _find_and_click_checkbox(self, driver, index: int):
-        """Async wrapper for checkbox clicking"""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(self.executor, self._find_and_click_checkbox_sync, driver, index)
+        """Selenium-based iframe and checkbox handling"""
+        def click_checkbox():
+            try:
+                # Пробуем разные селекторы iframe
+                iframe_selectors = [
+                    'iframe[src*="challenges.cloudflare.com"]',
+                    'iframe[src*="turnstile"]',
+                    'iframe[title*="widget"]'
+                ]
 
-    def _safe_click_sync(self, driver, selector: str, index: int):
-        """Selenium-based safe click"""
-        try:
-            if selector.startswith("//"):
-                # XPath selector
-                elements = driver.find_elements(By.XPATH, selector)
-            else:
-                # CSS selector
-                elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                iframe_element = None
+                for selector in iframe_selectors:
+                    try:
+                        iframes = driver.find_elements(By.CSS_SELECTOR, selector)
+                        if iframes:
+                            iframe_element = iframes[0]
+                            if self.debug:
+                                logger.debug(f"Browser {index}: Found Turnstile iframe with selector: {selector}")
+                            break
+                    except Exception as e:
+                        if self.debug:
+                            logger.debug(f"Browser {index}: Iframe selector '{selector}' failed: {str(e)}")
+                        continue
 
-            if elements:
-                ActionChains(driver).click(elements[0]).perform()
-                return True
-        except Exception as e:
-            if self.debug and "Can't query n-th element" not in str(e):
-                logger.debug(f"Browser {index}: Safe click failed for '{selector}': {str(e)}")
-        return False
+                if iframe_element:
+                    try:
+                        # Switch to iframe
+                        driver.switch_to.frame(iframe_element)
 
-    def _js_click_sync(self, driver, index: int):
-        """JavaScript click execution"""
-        try:
-            driver.execute_script("document.querySelector('.cf-turnstile')?.click()")
-            return True
-        except Exception as e:
-            if self.debug:
-                logger.debug(f"Browser {index}: JS click failed: {str(e)}")
+                        # Ищем чекбокс внутри iframe
+                        checkbox_selectors = [
+                            'input[type="checkbox"]',
+                            '.cb-lb input[type="checkbox"]',
+                            'label input[type="checkbox"]'
+                        ]
+
+                        for selector in checkbox_selectors:
+                            try:
+                                checkboxes = driver.find_elements(By.CSS_SELECTOR, selector)
+                                if checkboxes:
+                                    checkbox = checkboxes[0]
+                                    ActionChains(driver).click(checkbox).perform()
+                                    if self.debug:
+                                        logger.debug(f"Browser {index}: Successfully clicked checkbox in iframe with selector '{selector}'")
+                                    driver.switch_to.default_content()
+                                    return True
+                            except Exception as e:
+                                if self.debug:
+                                    logger.debug(f"Browser {index}: Iframe checkbox selector '{selector}' failed: {str(e)}")
+                                continue
+
+                        # Switch back to default content
+                        driver.switch_to.default_content()
+
+                        # Если не смогли кликнуть чекбокс, пробуем клик по iframe
+                        try:
+                            if self.debug:
+                                logger.debug(f"Browser {index}: Trying to click iframe directly as fallback")
+                            ActionChains(driver).click(iframe_element).perform()
+                            return True
+                        except Exception as e:
+                            if self.debug:
+                                logger.debug(f"Browser {index}: Iframe direct click failed: {str(e)}")
+
+                    except Exception as e:
+                        if self.debug:
+                            logger.debug(f"Browser {index}: Failed to access iframe content: {str(e)}")
+                        try:
+                            driver.switch_to.default_content()
+                        except:
+                            pass
+
+            except Exception as e:
+                if self.debug:
+                    logger.debug(f"Browser {index}: General iframe search failed: {str(e)}")
+
             return False
 
+        return await asyncio.get_event_loop().run_in_executor(None, click_checkbox)
+
     async def _safe_click(self, driver, selector: str, index: int):
-        """Async wrapper for safe click"""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(self.executor, self._safe_click_sync, driver, selector, index)
+        """Selenium-based safe click"""
+        def safe_click():
+            try:
+                if selector.startswith("//"):
+                    # XPath selector
+                    elements = driver.find_elements(By.XPATH, selector)
+                else:
+                    # CSS selector
+                    elements = driver.find_elements(By.CSS_SELECTOR, selector)
+
+                if elements:
+                    ActionChains(driver).click(elements[0]).perform()
+                    return True
+            except Exception as e:
+                if self.debug and "Can't query n-th element" not in str(e):
+                    logger.debug(f"Browser {index}: Safe click failed for '{selector}': {str(e)}")
+            return False
+
+        return await asyncio.get_event_loop().run_in_executor(None, safe_click)
 
     async def _js_click(self, driver, index: int):
-        """Async wrapper for JS click"""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(self.executor, self._js_click_sync, driver, index)
+        """JavaScript click execution"""
+        def js_click():
+            try:
+                driver.execute_script("document.querySelector('.cf-turnstile')?.click()")
+                return True
+            except Exception as e:
+                if self.debug:
+                    logger.debug(f"Browser {index}: JS click failed: {str(e)}")
+                return False
+
+        return await asyncio.get_event_loop().run_in_executor(None, js_click)
 
     async def _try_click_strategies(self, driver, index: int):
         strategies = [
@@ -595,48 +585,47 @@ class TurnstileAPIServer:
 
         return False
 
-    def _load_captcha_overlay_sync(self, driver, websiteKey: str, action: str = '', index: int = 0):
-        script = f"""
-        const existing = document.querySelector('#captcha-overlay');
-        if (existing) existing.remove();
-
-        const overlay = document.createElement('div');
-        overlay.id = 'captcha-overlay';
-        overlay.style.position = 'absolute';
-        overlay.style.top = '0';
-        overlay.style.left = '0';
-        overlay.style.width = '100vw';
-        overlay.style.height = '100vh';
-        overlay.style.backgroundColor = 'rgba(0, 0, 0, 0.5)';
-        overlay.style.display = 'block';
-        overlay.style.justifyContent = 'center';
-        overlay.style.alignItems = 'center';
-        overlay.style.zIndex = '1000';
-
-        const captchaDiv = document.createElement('div');
-        captchaDiv.className = 'cf-turnstile';
-        captchaDiv.setAttribute('data-sitekey', '{websiteKey}');
-        captchaDiv.setAttribute('data-callback', 'onCaptchaSuccess');
-        captchaDiv.setAttribute('data-action', '');
-
-        overlay.appendChild(captchaDiv);
-        document.body.appendChild(overlay);
-
-        const script = document.createElement('script');
-        script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js';
-        script.async = true;
-        script.defer = true;
-        document.head.appendChild(script);
-        """
-
-        driver.execute_script(script)
-        if self.debug:
-            logger.debug(f"Browser {index}: Created CAPTCHA overlay with sitekey: {websiteKey}")
-
     async def _load_captcha_overlay(self, driver, websiteKey: str, action: str = '', index: int = 0):
-        """Async wrapper for overlay creation"""
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(self.executor, self._load_captcha_overlay_sync, driver, websiteKey, action, index)
+        """Create CAPTCHA overlay"""
+        def create_overlay():
+            script = f"""
+            const existing = document.querySelector('#captcha-overlay');
+            if (existing) existing.remove();
+
+            const overlay = document.createElement('div');
+            overlay.id = 'captcha-overlay';
+            overlay.style.position = 'absolute';
+            overlay.style.top = '0';
+            overlay.style.left = '0';
+            overlay.style.width = '100vw';
+            overlay.style.height = '100vh';
+            overlay.style.backgroundColor = 'rgba(0, 0, 0, 0.5)';
+            overlay.style.display = 'block';
+            overlay.style.justifyContent = 'center';
+            overlay.style.alignItems = 'center';
+            overlay.style.zIndex = '1000';
+
+            const captchaDiv = document.createElement('div');
+            captchaDiv.className = 'cf-turnstile';
+            captchaDiv.setAttribute('data-sitekey', '{websiteKey}');
+            captchaDiv.setAttribute('data-callback', 'onCaptchaSuccess');
+            captchaDiv.setAttribute('data-action', '{action}');
+
+            overlay.appendChild(captchaDiv);
+            document.body.appendChild(overlay);
+
+            const script = document.createElement('script');
+            script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js';
+            script.async = true;
+            script.defer = true;
+            document.head.appendChild(script);
+            """
+
+            driver.execute_script(script)
+            if self.debug:
+                logger.debug(f"Browser {index}: Created CAPTCHA overlay with sitekey: {websiteKey}")
+
+        await asyncio.get_event_loop().run_in_executor(None, create_overlay)
 
     async def _solve_turnstile(self, task_id: str, url: str, sitekey: str, action: Optional[str] = None, cdata: Optional[str] = None):
         """Solve the Turnstile challenge."""
